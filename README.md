@@ -63,7 +63,7 @@ tests/          测试
 
 ### 1. 依赖
 
-- Python 3.10+
+- Python **3.11+**（用了 `typing.NotRequired`，3.10 没有）
 - `curl`（取数用子进程调用）
 
 ```bash
@@ -101,6 +101,10 @@ python3 src/analyze.py
 
 # 自检
 python3 src/selfcheck.py
+
+# 单元测试（本仓库 47/47；全新克隆是 45 通过 + 2 跳过 ——
+# 那 2 个需要 agent/.venv，而 agent/ 是独立仓库、不随本仓库分发）
+bash tests/run_all.sh
 ```
 
 ### 4. 常驻（macOS）
