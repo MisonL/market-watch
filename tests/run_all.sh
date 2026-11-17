@@ -47,8 +47,15 @@ for _t in tests/*.py; do
         *)                    _py=$_SYS_PY ;;
     esac
     if [ ! -x "$_py" ]; then
-        printf "  ⚠️  %-46s 解释器缺失：%s\n" "$_base" "$_py"
-        _n_fail=$((_n_fail + 1)); _failed="$_failed $_base"
+        # ⚠️ 2026-11-17（开源通用化）：解释器缺失是**环境缺失**，不是测试
+        # 失败 —— 原先记进 `_failed`，于是别人克隆后跑 `run_all.sh` 会看到
+        # 「失败 2」，而这 2 个测试压根没执行。分母不同、结论也不同。
+        # 改成计入 `_n_skip`，与其它 SKIP 同口径。
+        #
+        # 具体场景：`test_agent_summary_*` 需要 `agent/.venv`，而 `agent/`
+        # 是独立 git 仓库、已在本仓库的 .gitignore 里 —— 别人克隆后必然没有。
+        printf "  ⏭️  %-46s 跳过（解释器缺失：%s）\n" "$_base" "$_py"
+        _n_skip=$((_n_skip + 1))
         continue
     fi
 
