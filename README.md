@@ -126,7 +126,8 @@ bash tests/run_all.sh
 | `MW_LAUNCHD_PREFIX` | `com.mison.market` | launchd 标签前缀 |
 | `MW_FULL` | — | 变异测试强制全量 |
 | `MW_ONLY` | — | 只跑指定变异体（`a\|b\|c`） |
-| `MW_JOBS` | 3 | 变异测试并行度 |
+| `MW_JOBS` | 3 | 变异测试并行度（**CPU 密集型**，刻意取小） |
+| `MW_TEST_JOBS` | 动态 | 单元测试并行度（**IO 密集型**；不设则按实测吞吐自适应 4~12 路） |
 | `MW_SKIP_AI_PROBE` | — | 跳过 AI 探活（离线自检用） |
 | `MW_NO_LOCK` | — | 跳过 run 锁（仅调试） |
 

@@ -25,10 +25,15 @@
 # ## 并行执行（2026-11-17）
 #
 # 每个测试用独立的 `MW_DIR` 临时目录、独立子进程，状态互不干扰，
-# 所以可以并发跑。用 `MW_TEST_JOBS=N` 控制并发度：
+# 所以可以并发跑。并发度**动态决定**（2026-11-17）：
 #
-#     bash tests/run_all.sh                 # 默认 4 路
-#     MW_TEST_JOBS=1 bash tests/run_all.sh  # 退回串行（排查用）
+#     bash tests/run_all.sh                 # 自动：按机器负载与实测吞吐
+#     MW_TEST_JOBS=4 bash tests/run_all.sh  # 显式指定（环境变量永远优先）
+#     MW_TEST_JOBS=1 bash tests/run_all.sh  # 退回串行（排查竞态时用）
+#
+# ⚠️ 为什么不再写死 4 路：这台机器的常态是 load 60~100、CPU 只剩 2~5% 空闲
+# （一台常驻虚拟机吃掉 400%+ CPU）。写死 4 路在空闲时太保守、在拥挤时又不
+# 肯退让。详见 `src/concurrency.py` 的模块 docstring。
 #
 # ⚠️ 关键：**输出必须归属到各自的测试文件**。做法是每个测试把 stdout 写进
 # 自己的临时文件（`$_TMPDIR/<name>.out` + `.rc`），全部跑完后再逐个读取判定 ——
@@ -41,7 +46,15 @@ cd "$(dirname "$0")/.." || exit 1
 
 _SYS_PY=/usr/local/bin/python3
 _VENV_PY=agent/.venv/bin/python
-_JOBS=${MW_TEST_JOBS:-4}
+# 动态并发：环境变量优先，否则按「有效核数 - 当前负载」给初值。
+# `concurrency.py` 读不到负载时返回下限（不冒进）。
+_JOBS=$(cd "$(dirname "$0")/.." && /usr/local/bin/python3 -c '
+import sys; sys.path.insert(0, "src")
+from concurrency import resolve_workers
+print(resolve_workers("MW_TEST_JOBS", min_workers=2, max_workers=12))
+' 2>/dev/null || echo 4)
+case "$_JOBS" in ''|*[!0-9]*) _JOBS=4 ;; esac
+[ "$_JOBS" -lt 1 ] && _JOBS=1
 
 # 每个测试的临时产物集中在一个总目录，便于统一清理与归属
 _TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/mw_runall_XXXXXX") || exit 1
@@ -81,13 +94,62 @@ _run_one() {
 # 3.2 可用；`sleep 0.05` 的轮询开销相对每个测试几百毫秒可忽略。
 _QUEUE=$(ls tests/*.py)
 _n_total=$(printf '%s\n' "$_QUEUE" | wc -l | tr -d ' ')
+_n_dispatched=0
+_n_done_prev=0
+_t_round=$(date +%s)
+_JOBS_START=$_JOBS
+
+# ---------- 运行时自适应（2026-11-17） ----------
+#
+# 静态公式只能猜一个起点，真正的依据是**这一轮跑得多快**。
+# 每 3 秒看一次完成数：
+#   · 完成速度够快（≥ 1 个/秒·每 worker 的 1/4）→ 加一路
+#   · 明显停滞（连续两轮零完成）               → 减一路
+# 加减都只 ±1，避免在边界来回震荡。
+#
+# ⚠️ 只在**没有**显式设 `MW_TEST_JOBS` 时自适应 —— 使用者写了数字
+# 就是要那个数字（排查竞态时常见），不能被"机器看起来很闲"改掉。
+_ADAPT=1
+[ -n "${MW_TEST_JOBS:-}" ] && _ADAPT=0
+_stall=0
+
+_adapt_tick() {
+    [ "$_ADAPT" -eq 1 ] || return 0
+    _now=$(date +%s)
+    # 本轮完成数 = 当前派发数 - 仍在跑的数
+    _running=$(jobs -pr | wc -l | tr -d ' ')
+    _done=$((_n_dispatched - _running))
+    _delta=$((_done - _n_done_prev))
+    _el=$((_now - _t_round))
+    [ "$_el" -lt 3 ] && return 0
+    if [ "$_delta" -le 0 ]; then
+        _stall=$((_stall + 1))
+        if [ "$_stall" -ge 2 ] && [ "$_JOBS" -gt 2 ]; then
+            _JOBS=$((_JOBS - 1)); _stall=0
+        fi
+    else
+        _stall=0
+        # 每 3 秒完成 ≥1 个，且当前不到上限 → 加一路
+        if [ "$_JOBS" -lt 12 ]; then _JOBS=$((_JOBS + 1)); fi
+    fi
+    _n_done_prev=$_done
+    _t_round=$_now
+}
+
 for _t in $_QUEUE; do
     while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$_JOBS" ]; do
+        _adapt_tick
         sleep 0.05
     done
     _run_one "$_t"
+    _n_dispatched=$((_n_dispatched + 1))
 done
 wait   # 收尾：等最后 N 个跑完
+if [ "$_ADAPT" -eq 1 ] && [ "$_JOBS" -ne "$_JOBS_START" ]; then
+    echo "ℹ️  并发度 $_JOBS_START 路 → $_JOBS 路（运行时自适应）"
+elif [ "$_ADAPT" -eq 1 ]; then
+    echo "ℹ️  并发度 $_JOBS 路（自适应，MW_TEST_JOBS 可覆盖）"
+fi
 
 # 按文件名顺序汇总，保证输出稳定可读
 _n_ok=0; _n_fail=0; _n_skip=0; _failed=""

@@ -8,7 +8,7 @@
 ### 第一层：单元测试 + 自检
 
 ```bash
-bash tests/run_all.sh        # 46 个测试文件，秒级
+bash tests/run_all.sh        # 48 个测试文件，约 20s（并发度自适应）
 python3 src/selfcheck.py     # 契约校验 + 健康检查，1~3 分钟
 ```
 
