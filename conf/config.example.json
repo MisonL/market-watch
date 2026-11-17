@@ -1,0 +1,14 @@
+{
+ "_note": "⚠️ poll_seconds / market_open / market_close / quiet_after 这 4 个字段**当前不生效**，改它们不会有任何效果。",
+ "_note_2": "  · 调度间隔由 launchd plist 的 StartInterval 决定（建议 300s）",
+ "_note_3": "  · 真实交易时段在 marketlib.TH['session']（09:25~15:05）",
+ "_note_4": "  · 保护时段在 marketlib.TH['guard_*']（开盘/午间/尾盘）",
+ "_note_5": "  · 真正可调的阈值在 sectors.json 的 thresholds（改了立即生效，无需重启）",
+ "_note_6": "保留这些字段仅为兼容旧版本读取，删除亦可（无代码引用）。",
+ "_note_7": "本文件是**模板**。复制为 config.json 后填入你自己的 webhook，并把权限设为 600。",
+ "webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_WITH_YOUR_KEY",
+ "poll_seconds": 300,
+ "market_open": "09:30",
+ "market_close": "15:00",
+ "quiet_after": "14:50"
+}

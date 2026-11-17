@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd 任务模板（示例：analyze 主循环，每 300s 一轮）
+
+  用法：
+    1. 复制本文件到 ~/Library/LaunchAgents/<你的前缀>.marketwatch.plist
+    2. 把 ___ 占位符替换成你的实际路径
+    3. launchctl bootout gui/$(id -u)/<label> 2>/dev/null
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+
+  需要 4 个任务（对应 src/ 下的入口）：
+    marketwatch      → src/analyze.py      StartInterval 300
+    marketcollect    → src/collect.py      StartInterval 300
+    marketwebui      → src/webui.py        KeepAlive true
+    marketselfcheck  → src/selfcheck.py    StartInterval 86400 + RunAtLoad
+
+  标签前缀要与你设的 MW_LAUNCHD_PREFIX 一致（默认 com.mison.market）。
+  注意：plist 里的 EnvironmentVariables 不会自动带上你的 MW_LAUNCHD_PREFIX，
+  前缀不同时请一并写进来。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.marketwatch</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>___HOME___/.market-watch/src/analyze.py</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- launchd 默认 PATH 很短，找不到 curl / python 的第三方工具时会静默失败 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <!-- 需要代理兜底时打开：
+    <key>MW_PROXY</key>
+    <string>http://127.0.0.1:7890</string>
+    -->
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>___HOME___/.market-watch/logs/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>___HOME___/.market-watch/logs/stderr.log</string>
+</dict>
+</plist>
