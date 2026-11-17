@@ -1,0 +1,24 @@
+# agent 是独立 git 仓库（uv 项目），不进外层版本控制
+agent/
+# launchd 运行时日志与锁（体积大、随进程重建）—— 生产运行态，不入 git
+logs/
+# 沙箱/回归临时产物
+.superpowers/
+__pycache__/
+# 运行态（持续变化、含行情缓存与推送历史）—— 不入 git
+state/
+
+# 凭据与机器相关（2026-11-01 移出版本库）
+conf/config.json
+.DS_Store
+.emergency/
+
+# 个人持仓（2026-11-06 移出版本库）
+conf/private-notes.md
+
+# 持仓主档（含持仓/金额/操作安排，2026-11-17 公开发布前移出版本库）
+conf/claude-plan.md
+# 本地 launchd plist 实例（含本机路径）
+conf/launchd/
+# 个人市场判断（2026-11-17 公开发布前移出版本库；模板见 conf/plan.example.md）
+conf/plan.md

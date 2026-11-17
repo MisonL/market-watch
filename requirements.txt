@@ -1,0 +1,6 @@
+# 运行时无第三方依赖 —— 全部用标准库 + curl 子进程。
+# 本文件刻意留空，方便 `pip install -r requirements.txt` 不报错。
+#
+# 开发/测试可选依赖（不在运行时路径上）：
+#   pyflakes   静态检查
+#   black      格式化（⚠️ 见 CONTRIBUTING 的说明：全量重排会破坏变异体锚点）
