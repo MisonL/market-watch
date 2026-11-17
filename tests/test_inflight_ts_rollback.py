@@ -102,6 +102,26 @@ def _stub(urgent_hit=False, push_ok=True):
                                 "chg": 5.0, "news": []}], "")
                        if urgent_hit else
                        (False, [], ""))
+
+    # ⚠️ 2026-11-17（测试提速）：原实现只 stub 了 analyze 层的函数，
+    # 却漏了 `_run_after_inflight` 里的两处**真联网**：
+    #   `hot.analyze_cached()`（内部 158 次 curl / 50s）
+    #   `news.fetch_news()`
+    # 这个测试验证的是**纯状态机**（inflight_ts 回退 + sent 不变式），
+    # 与真实行情/资讯毫无关系 —— 联网只是副作用。
+    # 注意 `analyze.py` 在函数内部 `import hot as HOT` / `import news as NEWS`，
+    # 所以要在**模块对象**上打桩才拦得住，不能改 analyze 的名字。
+    _orig_mod = {}
+    import hot as _hot_mod
+    import news as _news_mod
+    for _m, _n, _fn in ((_hot_mod, "analyze_cached",
+                         lambda **k: {"strong": [], "start": [],
+                                      "top_up": [], "top_dn": [],
+                                      "pool": 0, "dedup": 0}),
+                        (_news_mod, "fetch_news", lambda *a, **k: [])):
+        _orig_mod[(_m, _n)] = getattr(_m, _n)
+        setattr(_m, _n, _fn)
+    _stub._orig_mod = _orig_mod
     return _orig
 
 
@@ -110,6 +130,9 @@ def _restore(o):
      analyze.detect, analyze.build_brief, analyze.produce_text,
      analyze.build_urgent, analyze.push, analyze.hourly_slot,
      AL.should_alert, analyze.save_st) = o
+    for (_m, _n), _fn in getattr(_stub, "_orig_mod", {}).items():
+        setattr(_m, _n, _fn)
+    _stub._orig_mod = {}
 
 
 def _run(st, urgent=(), hourly=None):

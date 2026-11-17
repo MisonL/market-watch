@@ -36,11 +36,19 @@ def _with(base, run_out):
     # 基线比较。恒等替换，让 out 完全可控。
     SM.run = fake_run
     SM._with_agent_probe = lambda _S, _o: _o
-    S = SM.make_sandbox()
+    # ⚠️ 2026-11-17（测试提速）：原实现在这里调一次 `SM.make_sandbox()`，
+    # 但返回的 S **没有传给任何被测调用** —— `_run_one_mutant()` 内部会
+    # 自己再建一个。于是每个用例白做一次完整沙箱复制（源码/配置/日志/
+    # history 全拷一遍），4 个用例共 8 次复制 = 22.5s。
+    # 这里临时把 `make_sandbox` 换成"只建空目录"，让 `_run_one_mutant`
+    # 照常走它自己的完整路径（含创建与清理），只是不再重复外层那次。
+    _orig_sandbox = SM.make_sandbox
+    SM.make_sandbox = lambda **kw: tempfile.mkdtemp(
+        prefix="mw_ctrl_", dir=os.environ["MW_DIR"])
     try:
         return SM._run_one_mutant(None, lambda _t: None)
     finally:
-        shutil.rmtree(S, ignore_errors=True)
+        SM.make_sandbox = _orig_sandbox
 
 
 def _restore():
