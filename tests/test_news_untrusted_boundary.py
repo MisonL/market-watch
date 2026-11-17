@@ -68,6 +68,12 @@ def _capture(malicious_title):
     NEWS.macro_news = lambda ns, **k: []
     NEWS.fetch_news = lambda n=80: [dict(_news_item, name="半导体")]
 
+    # ⚠️ 2026-11-17（测试提速）：`build_brief()` 内部会调 `M.levels()` 取
+    # 关键位（20/60 日高低）。沙箱缓存为空 → 它**真的发 HTTP 拉日K**
+    # → 本测试 4.6s 里绝大部分是在等网络（实测漏桩，cProfile 指到
+    # analyze.py:2762 → marketlib.py:2733 的日K取数）。
+    # 本测试验证的是**快讯边界夹持**，与关键位数值无关 —— 给个最小夹具即可。
+    analyze.M.levels = lambda *a, **k: None
     analyze._quotes_from_snapshot = lambda **k: {}
     analyze._quotes = lambda *a, **k: {}
     analyze._trend = lambda *a, **k: None

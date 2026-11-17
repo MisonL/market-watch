@@ -68,20 +68,26 @@ _run_one() {
     ) &
 }
 
-# 派发全部测试，按批次控制并发度。
-# ⚠️ 不用 `wait -n` —— macOS 自带 bash 3.2 不支持它（`wait: -n: invalid option`）。
-# 改用"每批 N 个、等整批完成再派下一批"，虽不如线程池精细，但简单可靠：
-# 输出归属靠各自的 .out/.rc 文件，与调度方式无关。
-_n_running=0
-for _t in tests/*.py; do
+# 派发全部测试：**滚动补位**，而不是按批等待。
+#
+# ⚠️ 2026-11-17（调度改进）：原先"每 N 个一批、等整批完成再派下一批"有个
+# 真实的浪费 —— 批里跑完的槽位要等**最慢那个**跑完才能补新任务。
+# `[实测]` 六个最慢的文件（13s/10s/9s/8s/4.6s/4.5s）恰好被排进同几批，
+# 仅它们就贡献了约 40s 的关键路径，并行几乎白搭。
+#
+# 现在改成：始终维持 N 个在跑，任一跑完立刻补下一个。
+# ⚠️ 不用 `wait -n` —— macOS 自带 bash 3.2 不支持（`wait: -n: invalid
+# option`，实测会静默退化成等全部）。改用「轮询 + `jobs -pr` 数活跃数」，
+# 3.2 可用；`sleep 0.05` 的轮询开销相对每个测试几百毫秒可忽略。
+_QUEUE=$(ls tests/*.py)
+_n_total=$(printf '%s\n' "$_QUEUE" | wc -l | tr -d ' ')
+for _t in $_QUEUE; do
+    while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$_JOBS" ]; do
+        sleep 0.05
+    done
     _run_one "$_t"
-    _n_running=$((_n_running + 1))
-    if [ "$_n_running" -ge "$_JOBS" ]; then
-        wait
-        _n_running=0
-    fi
 done
-wait   # 等最后不足一批的剩余测试
+wait   # 收尾：等最后 N 个跑完
 
 # 按文件名顺序汇总，保证输出稳定可读
 _n_ok=0; _n_fail=0; _n_skip=0; _failed=""

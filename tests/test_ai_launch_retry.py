@@ -41,6 +41,16 @@ def check(cond, msg):
 
 
 calls = {"n": 0}
+# ⚠️ 2026-11-17（测试提速）：`ai_analyze()` 在启动失败后**真的**
+# `time.sleep(2)` 再重试（analyze.py:4800），本文件两个场景各走一次 =
+# 固定白等 4 秒，占本测试 4.5s 的九成。
+# 这里把 sleep **记下来但不真等**：等待时长本身是契约的一部分
+# （「2 秒后重试一次」），所以**断言它确实是 2**，而不是简单跳过。
+sleeps = []
+
+
+def _fake_sleep(sec):
+    sleeps.append(sec)
 
 
 def _wd(*a, **k):
@@ -55,10 +65,14 @@ def _wd(*a, **k):
 
 with patch.object(A.M, "claude_bin", return_value=("/bin/true", None)), \
      patch.object(A.M, "run_with_idle_watchdog", side_effect=_wd), \
+     patch.object(A.time, "sleep", side_effect=_fake_sleep), \
      patch.object(A.M, "_AI_FAIL_FILE", os.path.join(os.environ["MW_DIR"], "f.json")):
     A._ROUND_AI_MS[:] = []
+    sleeps.clear()
     out = A.ai_analyze("事实", [], "", slot="11:30")
     check(calls["n"] >= 2, f"启动失败后没有重试（只调用了 {calls['n']} 次）")
+    # 等待时长是契约：写死 2 秒，别让它被悄悄改成 0 或 30
+    check(sleeps == [2], f"重试前的等待应为 [2]，实际 {sleeps}")
     check("可用正文OK" in out, f"重试成功却没拿到正文，实际 {out!r}")
     check(not os.path.exists(A.M._AI_FAIL_FILE), "启动失败被写成了通道熔断")
 
@@ -67,8 +81,10 @@ calls["n"] = 0
 with patch.object(A.M, "claude_bin", return_value=("/bin/true", None)), \
      patch.object(A.M, "run_with_idle_watchdog",
                   return_value=(None, "", "Popen 失败: [Errno 8] Exec format error", False)), \
+     patch.object(A.time, "sleep", side_effect=_fake_sleep), \
      patch.object(A.M, "_AI_FAIL_FILE", os.path.join(os.environ["MW_DIR"], "f2.json")):
     A._ROUND_AI_MS[:] = []
+    sleeps.clear()
     out2 = A.ai_analyze("事实", [], "", slot="11:30")
     check(out2 == "", f"一直起不来应返回空串，实际 {out2!r}")
     check(not os.path.exists(A.M._AI_FAIL_FILE), "持续启动失败被写成了通道熔断")
