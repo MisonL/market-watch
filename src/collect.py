@@ -762,7 +762,24 @@ def _main():
 
     # 累积当日快照（保留最近24条，供 Claude 看趋势）
     hist = []
-    if os.path.exists(OUT):
+    # ⚠⚠ 2026-11-17（P1 并发缺陷修复）：**取锁必须无条件、且在 exists 判断之外**。
+    #
+    # 原实现把 `_pending_lock(OUT)` 写在 `if os.path.exists(OUT):` 分支**内部**。
+    # 于是 `pending.json` 还不存在时（**首次运行**、当日首次采集、清空 state 后
+    # 第一轮）整个分支被跳过 —— **一个字节的锁都没取**，直接落到下方
+    # `if os.path.exists(OUT)`（events 那段）同样跳过，然后直接写盘。
+    #
+    # `[实测]` 沙箱里 4 个 `_main()` 并发、`pending.json` 预先不存在：
+    #   hist=3（应为 4）—— 丢了 1 条，且两条路径都无锁。
+    #   同一场景文件**预先存在**时：hist=5（应为 5），锁工作正常。
+    # 这解释了 `test_review_20261111.py` 的偶发红：它不预热文件，
+    # 4 进程直接起跑，正好踩中"文件不存在"这条无锁路径。
+    #
+    # 注意 `_load_json` 在文件不存在时返回 None，与"解析失败"同形 ——
+    # 所以这里**不能**用"文件存在"来决定要不要读，只能决定报不报 ERR。
+    _pnd_lk = _pending_lock(OUT)
+    _file_existed = os.path.exists(OUT)
+    if _file_existed:
         # ⚠️ 损坏必须留痕。原先 `except Exception: pass` 把"解析失败"和
         # "当天没有历史"混为一谈 —— 实测截断 pending.json 后 7 条 events +
         # 12 条 hist 全部丢失，状态串仍是 "ok"，日志里零记录。
@@ -789,7 +806,6 @@ def _main():
         # events 去重表少一批（去重表丢了会**重复推送**）。
         # 用与 `runlog.beat` 同一套：独立 `.lock` 文件 + flock，锁失败就退回无锁
         # （采集不能因为锁而不工作）。锁覆盖整段读-改-写，到写完为止。
-        _pnd_lk = _pending_lock(OUT)
         old = M._load_json(OUT, None)
         if old is None:
             _log("pending.json 无法解析（截断/非 JSON），本轮历史为空", "ERR")

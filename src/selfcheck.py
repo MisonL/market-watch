@@ -12015,6 +12015,19 @@ def _main(ok_all):
             # 判据用 `\*{0,2}`：星号可有（0~2 个）可无，数字本身照抓。
             _sg = M.config() or {}
             _th = _sg.get("thresholds", {}) or {}
+            # ⚠⚠ 2026-11-17（P1 自检误报修复）：必须**限定在恒科语境**内匹配。
+            #
+            # 原正则 `下方\s*(\d+)` 全文扫，会把**别的标的**的支撑位当成
+            # hstech_down。`[实测]` plan.md 第 20 行写「…上证 3584.58 失守
+            # 3600/3610，下方 3550」，被读成 hstech_down=3550 →
+            # 连报两条假 ❌（「plan.md 写 3550」「自相矛盾 [3550,3737]」），
+            # 而 hstech_down 真值 3737 在同一段里写得好好的。
+            # 这种误报比漏报更坏：它会让人去改一个本来正确的文件。
+            #
+            # 修法：先按句切分，只保留**含恒科关键词**的句子再匹配。
+            _hk_ctx = "".join(
+                _seg for _seg in _re14e.split(r"[。；\n]", _plan_txt)
+                if any(_kw in _seg for _kw in ("恒科", "恒生科技", "hstech")))
             _pairs = [(r"上方\s*\*{0,2}(\d+(?:\.\d+)?)", "hstech_up"),
                       (r"下方\s*\*{0,2}(\d+(?:\.\d+)?)", "hstech_down")]
             _drift = []
@@ -12025,7 +12038,7 @@ def _main(ok_all):
                 # （**下方 3781**）写法不同（少了「现行」前缀、星号位置不同），
                 # 于是**首个匹配永远落在正确的那处**，漂移一直看不见。
                 # `[实测]` 2026-10-30 14:51 推送里 AI 两次写 3781（旧线）。
-                _pmvs = _re14e.findall(_pat, _plan_txt)
+                _pmvs = _re14e.findall(_pat, _hk_ctx or _plan_txt)
                 _real = _th.get(_key)
                 if not _pmvs or _real is None:
                     continue
