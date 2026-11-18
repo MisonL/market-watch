@@ -72,13 +72,32 @@ jobs:
         # 就把跳过的事实藏掉。rc=1（真失败）仍然让 job 失败。
         run: |
           set +e
-          bash tests/run_all.sh
-          rc=$?
+          bash tests/run_all.sh | tee /tmp/run_all.out
+          rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -eq 0 ]; then
             echo "✅ 全部通过"
           elif [ "$rc" -eq 2 ]; then
             echo "::warning::有测试被跳过（CI 环境缺 agent/.venv，属预期）—— 见上方输出"
+            # ⚠⚠ 2026-11-18（第一次 CI 实测暴露）：**必须防"全部跳过"**。
+            # 首次运行 CI 时解释器被硬编码成 `/usr/local/bin/python3`（macOS
+            # 路径），Linux 上不存在 → 48 个测试**全部**跳过，而 rc 仍是 2。
+            # 若只判 rc，会得到一个"全绿但什么都没验"的结论。
+            # 现在显式要求：通过数必须 > 0，且跳过数不得超过总测试数的一半。
+            # 解析汇总行「通过 N / 跳过 M / 失败 K」
+            line=$(grep -E '^通过 [0-9]+ / 跳过 [0-9]+ / 失败 [0-9]+' /tmp/run_all.out | tail -1)
+            n_ok=$(echo "$line" | sed -E 's|通过 ([0-9]+).*|\1|')
+            n_skip=$(echo "$line" | sed -E 's|.*跳过 ([0-9]+).*|\1|')
+            n_total=$(( ${n_ok:-0} + ${n_skip:-0} + ${n_fail:-0} ))
+            echo "通过 ${n_ok:-?} / 跳过 ${n_skip:-?} / 共 $n_total"
+            if [ "${n_ok:-0}" -eq 0 ]; then
+              echo "::error::一个测试都没真正执行（全部跳过）—— 这不是通过"
+              exit 1
+            fi
+            if [ "${n_skip:-0}" -gt $(( n_total / 2 )) ]; then
+              echo "::error::跳过数 ${n_skip} 超过总数 $n_total 的一半 —— 环境有问题"
+              exit 1
+            fi
           else
             echo "::error::测试失败 rc=$rc"
             exit "$rc"

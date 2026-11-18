@@ -44,7 +44,34 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 1
 
-_SYS_PY=/usr/local/bin/python3
+# ⚠⚠ 2026-11-18（CI 实测发现）：**不能硬编码解释器路径**。
+#
+# 原写死 `_SYS_PY=/usr/local/bin/python3` —— 那是 macOS Homebrew 的位置。
+# 在 Linux（GitHub Actions runner）上它**不存在**，于是每个测试都被判成
+# 「解释器缺失」而跳过。`[实测]` 第一次 CI 跑出来是：
+#
+#     通过 0 / 跳过 48 / 失败 0     ← 48 个测试一个都没执行，却显示"成功"
+#
+# 这比"跑失败"更糟：它给了一个**全绿但什么都没验**的结论。正是本文件
+# 文件头"坑 1"批评的那种元层面失败，只是这次藏在解释器选择里。
+#
+# 现在按优先级探测，保留 `/usr/local/bin/python3` 优先（macOS 上用户装的
+# 3.14 比系统的 3.9 新，本项目要 3.11+），找不到再退回 PATH 里的 `python3`。
+# 探测失败时**显式报错退出**，而不是让所有测试静默跳过。
+_SYS_PY=""
+for _cand in /usr/local/bin/python3 /opt/homebrew/bin/python3 python3 python; do
+    if command -v "$_cand" >/dev/null 2>&1; then
+        # 必须是 3.11+（`typing.NotRequired` 是 3.11 才有的）
+        if "$_cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null; then
+            _SYS_PY=$_cand; break
+        fi
+    fi
+done
+if [ -z "$_SYS_PY" ]; then
+    echo "❌ 找不到 Python 3.11+（试过 /usr/local/bin、/opt/homebrew/bin、PATH）" >&2
+    echo "   本项目需要 3.11+（使用了 typing.NotRequired）。" >&2
+    exit 3
+fi
 _VENV_PY=agent/.venv/bin/python
 # 动态并发：环境变量优先，否则按「有效核数 - 当前负载」给初值。
 # `concurrency.py` 读不到负载时返回下限（不冒进）。
