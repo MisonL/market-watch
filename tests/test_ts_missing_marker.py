@@ -56,8 +56,21 @@ def check():
             f"{_k}（f124 不可用）必须标 `_ts_missing`，实得 {_o[_k]}")
         assert not _o[_k].get("_ts"), f"{_k} 不应被注入 _ts"
 
-    assert _o["good"].get("_ts") == "20251105074640", (
-        f"正常 unix 秒应注入 _ts，实得 {_o['good'].get('_ts')}")
+    # ⚠️ 2026-11-18（CI 实测发现）：**不能硬编码带时区的期望值**。
+    #
+    # 原写死 `"20251105074640"` —— 那是**本机 CST** 下的结果。CI runner 是
+    # UTC，同一时间戳解析出来差 8 小时，于是这条断言在 Linux 上必然失败
+    # （`[实测]` `TZ=UTC` 本地可复现，得到 `20251104234640`）。
+    #
+    # 这里要验的是「f124 是有效 unix 秒 → 被转成 %Y%m%d%H%M%S 并带上
+    # `_ts_crossday`」，不是「本机时区恰好是 CST」。所以按**同一规则**
+    # 现算期望值：跑测试的机器用什么时区，生产代码也用什么时区，
+    # 两者一致即可。这不是放宽断言 —— 下面的格式与 crossday 断言照旧。
+    import datetime as _dt
+    _want = _dt.datetime.fromtimestamp(1762300000).strftime("%Y%m%d%H%M%S")
+    assert _o["good"].get("_ts") == _want, (
+        f"正常 unix 秒应注入 _ts={_want}，实得 {_o['good'].get('_ts')}")
+    assert len(_o["good"].get("_ts") or "") == 14, "`_ts` 必须是 14 位时间串"
     assert _o["good"].get("_ts_crossday") is True, "主路径注入的行必须标 crossday"
     assert _o["good"].get("_ts_missing") is None, "成功注入的行不该带 missing"
 

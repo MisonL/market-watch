@@ -53,16 +53,33 @@ print(json.dumps({"p": _cap.get("p", "")}, ensure_ascii=False))
     _sub = tempfile.mkdtemp(prefix="mw_slot_")
     _env = os.environ.copy()
     _env["MW_DIR"] = _sub
+    # ⚠⚠ 2026-11-18（CI 实测发现）：**必须设 timeout，且失败要能看出来**。
+    #
+    # 原实现没有 timeout，且解析失败时静默 `return ""` —— 于是子进程
+    # 挂住会无限等，子进程崩溃/输出异常则变成"没拿到 prompt（桩未生效？）"
+    # 这条**归因错误**的断言消息。`[实测]` CI runner（共享、较慢）上
+    # `test_slot_advice_rule.py` 报的就是这句，而根因是子进程没跑完/没过，
+    # 与桩没关系。
+    #
+    # 现在：超时 120s（CI 上 Python 冷启动明显更慢），失败时把 stderr
+    # 带进返回值，让断言能说清到底为什么。
+    import json as _js
     try:
         _r = subprocess.run([sys.executable, "-B", "-c", _code],
-                            capture_output=True, text=True, env=_env)
+                            capture_output=True, text=True, env=_env,
+                            timeout=120)
+    except subprocess.TimeoutExpired:
+        return "[[子进程超时 120s]]"
     finally:
         shutil.rmtree(_sub, ignore_errors=True)
-    import json
+    if _r.returncode != 0:
+        _tail = ((_r.stderr or "").strip().splitlines() or [""])[-1]
+        return f"[[子进程 rc={_r.returncode}: {_tail[:160]}]]"
     try:
-        return json.loads(_r.stdout.strip().split("\n")[-1])["p"]
-    except Exception:
-        return ""
+        return _js.loads(_r.stdout.strip().split("\n")[-1])["p"]
+    except Exception as _e:
+        _raw = (_r.stdout or "").strip()[-160:]
+        return f"[[输出解析失败 {type(_e).__name__}: stdout={_raw!r}]]"
 
 
 def check():
