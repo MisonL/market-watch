@@ -60,11 +60,14 @@ cd "$(dirname "$0")/.." || exit 1
 # 探测失败时**显式报错退出**，而不是让所有测试静默跳过。
 _SYS_PY=""
 for _cand in /usr/local/bin/python3 /opt/homebrew/bin/python3 python3 python; do
-    if command -v "$_cand" >/dev/null 2>&1; then
-        # 必须是 3.11+（`typing.NotRequired` 是 3.11 才有的）
-        if "$_cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null; then
-            _SYS_PY=$_cand; break
-        fi
+    # ⚠️ 必须取**绝对路径**：下面 `_run_one` 用 `[ ! -x "$_py" ]` 判断可用性，
+    # 而 `command -v python3` 只返回 `python3`（PATH 名），`-x python3` 在当前
+    # 目录下找会失败 → 又变成"解释器缺失"。`[实测]` 第一版就是这么漏的：
+    # 改了探测逻辑，CI 里仍然 48 个全跳过。
+    _abs=$(command -v "$_cand" 2>/dev/null) || continue
+    case "$_abs" in /*) ;; *) _abs=$(cd "$(dirname "$_abs")" && pwd)/$(basename "$_abs") ;; esac
+    if "$_abs" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null; then
+        _SYS_PY=$_abs; break
     fi
 done
 if [ -z "$_SYS_PY" ]; then
@@ -75,7 +78,7 @@ fi
 _VENV_PY=agent/.venv/bin/python
 # 动态并发：环境变量优先，否则按「有效核数 - 当前负载」给初值。
 # `concurrency.py` 读不到负载时返回下限（不冒进）。
-_JOBS=$(cd "$(dirname "$0")/.." && /usr/local/bin/python3 -c '
+_JOBS=$(cd "$(dirname "$0")/.." && "$_SYS_PY" -c '
 import sys; sys.path.insert(0, "src")
 from concurrency import resolve_workers
 print(resolve_workers("MW_TEST_JOBS", min_workers=2, max_workers=12))
