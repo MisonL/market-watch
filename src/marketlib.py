@@ -26,15 +26,44 @@ from typing import Any, TypedDict
 # 修法：按可用性降级，优先 typing_extensions（backport，覆盖到 3.8）。
 # 两者都没有时退回 `bool` —— 只损失类型收窄能力，运行时行为完全不变
 # （`isnum` 的实现体不依赖 TypeIs）。
+# ⚠⚠ 2026-11-18（CI 实测发现）：`TypeIs` 是 **3.13+**，不是 3.12+。
+#
+# PEP 742 在 **Python 3.13** 才进入标准库。3.11 / 3.12 上
+# `from typing import TypeIs` 抛 ImportError —— 这没问题（有降级）。
+#
+# 真正的问题在**降级路径本身写得不能跑**：原兜底是
+#
+#     TypeIs = bool
+#
+# 而 `isnum` 的签名是 `-> TypeIs[int | float]`。函数定义时（模块导入期）
+# 就会对标注求值 → `bool[int | float]` → **TypeError: type 'bool' is not
+# subscriptable**。于是在 3.11/3.12 上，**整个 marketlib 导入即失败**，
+# 38 个测试、以及生产里的 collect/analyze 全起不来。
+#
+# `[实测]` GitHub Actions 的 3.11 job：38 个测试失败，全部是这个错；
+# 本机 `/Users/mison/.local/bin/python3.11` 可完整复现（traceback 指到
+# 本文件的 `def isnum` 那一行）。
+#
+# 修法：兜底用一个**可下标**的代理对象 —— 它被调用时返回第一个参数，
+# 也就是"标注按原样透传"，运行时零行为。这样 `TypeIs[int | float]`
+# 求值成 `int | float`，函数正常工作。
+#
+# 注意：这只影响**运行时**。类型检查器（pyright/mypy）看到的是真正的
+# TypeIs（它们自带 3.13 的 typing 存根，不受运行解释器版本影响）。
+class _TypeIsFallback:
+    """`TypeIs` 的运行时替身：`_TypeIsFallback[T]` 求值为 `T` 本身。"""
+
+    def __class_getitem__(cls, item):
+        return item
+
+
 try:
-    from typing import TypeIs                      # 3.12+
+    from typing import TypeIs                      # 3.13+
 except ImportError:                                # pragma: no cover
     try:
-        from typing_extensions import TypeIs       # backport
+        from typing_extensions import TypeIs       # backport（覆盖 3.8+）
     except ImportError:
-        # 最后兜底：TypeIs 只影响类型检查器，运行时它就是"任意标注"。
-        # 用 TypeAlias 之外最朴素的方式 —— 直接当 bool 标注用。
-        TypeIs = bool  # type: ignore[assignment,misc]
+        TypeIs = _TypeIsFallback  # type: ignore[assignment,misc]
 
 # 允许 MW_DIR 覆盖：测试可在沙箱里跑而完全不碰线上状态文件
 from paths import p_cache, p_state, p_conf, p_log, CACHE_DIR, LOGS_DIR
