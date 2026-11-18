@@ -43,6 +43,18 @@ def _spy(cmd, **kw):
     _cap["p"] = kw.get("stdin_text") or ""
     return (0, "**触发** x" + "\n" + "**关注板块** y" + "\n" + "**建议** z" + "x"*80, "", False)
 M.run_with_idle_watchdog = _spy
+# ⚠⚠ 2026-11-18（CI 实测发现）：**必须同时桩 `claude_bin`**。
+#
+# `ai_analyze()` 在 `_invoke` 之前先调 `M.claude_bin()`，拿不到路径就
+# `_log("claude CLI 未找到…")` 并 **直接 return ""** —— 根本走不到
+# `run_with_idle_watchdog` 那个桩，于是 `_cap["p"]` 一直是空。
+#
+# 本机装了 claude CLI，所以这条路径本地永远不触发；GitHub runner 上没有，
+# 于是两个 Python 版本都报「09:25 没拿到 prompt（桩未生效？）」——
+# 而真正的原因不是桩失效，是**CLI 不存在导致函数提前返回**。
+#
+# 这是本文件第二次栽在"依赖本机环境"上（上一次是无 timeout）。
+M.claude_bin = lambda: ("/bin/true", None)
 import analyze
 analyze.ai_analyze("【关注板块】\n半导体 +1.0%%\n", [], "计划", slot=%r)
 print(json.dumps({"p": _cap.get("p", "")}, ensure_ascii=False))
