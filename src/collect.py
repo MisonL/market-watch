@@ -341,12 +341,12 @@ def evaluate(q, sg, now):
         # 改用字面量是为了另一种情况：若某天该键从 TH 里被删掉，
         # 写 TH[k] 会在**求值实参时**直接 KeyError（在 threshold 内部兜底之前就炸），
         # 而字面量会安静地退回一个明确的值。
-        if v["f2"] <= threshold("hstech_down", 3737):
+        if v["f2"] <= threshold("hstech_down", 3695):
             # ⚠️ 键名必须是 hstech_down（与 analyze.detect / webui 一致）。
             # 原先写 hstech_dn —— 同一事件两个名字，pending.json 里叫 dn、
             # fired 里叫 down，面板按 down 查永远查不到。
             # （阈值键 hstech_down 本来就对，只有事件键写错了。）
-            ev.append({"k":"hstech_down","msg":f"恒生科技 {v['f2']} ≤ {threshold('hstech_down', 3737)}",
+            ev.append({"k":"hstech_down","msg":f"恒生科技 {v['f2']} ≤ {threshold('hstech_down', 3695)}",
                        "chg":_v3,"prio":"high"})
     if not guard:
         # IDX3S() 返回 {完整 secid: (名称, 阈值)}（来自 M.idx_thresholds()），

@@ -148,7 +148,7 @@
  "algo_top": 5,
  "thresholds": {
   "hstech_up": 4243.65,
-  "hstech_down": 3737.0,
+  "hstech_down": 3695.0,
   "semi_fund_out": -30,
   "semi_fund_in": 70,
   "gold_up": 2.5,
