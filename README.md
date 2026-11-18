@@ -1,5 +1,7 @@
 # market-watch
 
+[![test](https://github.com/MisonL/market-watch/actions/workflows/test.yml/badge.svg)](https://github.com/MisonL/market-watch/actions/workflows/test.yml)
+
 A 股 / 港股盘中盯盘与推送系统。定时抓取行情、判断异动、生成简报并推送
 到企业微信群。
 
