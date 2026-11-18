@@ -29,6 +29,7 @@
 """
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src"))
@@ -123,5 +124,69 @@ check(_t3.adjust() == 2, "不能低于 lo")
 # observe() 未 mark() 时返回 None（不误改）
 _t4 = C.AdaptiveThrottle(lo=1, hi=4, start=2)
 check(_t4.observe() is None, "未 mark() 时应返回 None，不能瞎算一个比值")
+
+# ---------- 容器（Docker）部署：cgroup 感知 ----------
+#
+# 为什么必须单测：容器里 `os.cpu_count()` 返回**宿主机**核数，不是限额。
+# `--cpus=2` 跑在 16 核机上照样报 16 → 并发按 16 算 → 十几个 worker 抢 2 核。
+# `os.getloadavg()` 同理读宿主机，宿主机忙就误判我方过载。
+# 两个都不是"理论风险"：部署到 Docker 就会立刻踩到。
+_TD = tempfile.mkdtemp(prefix="mw_cg_")
+_CF = os.path.join(_TD, "cpu.max")
+_REAL_EXISTS, _REAL_OPEN = os.path.exists, open
+
+
+def _as_container(spec):
+    """把 concurrency 的 cgroup 读路径指到临时文件。"""
+    with open(_CF, "w", encoding="utf-8") as _f:
+        _f.write(spec + "\n")
+    C.os.path.exists = lambda p: True if p == "/sys/fs/cgroup/cpu.max" else _REAL_EXISTS(p)
+    C.open = (lambda p, *a, **k: _REAL_OPEN(_CF, *a, **k)
+              if p == "/sys/fs/cgroup/cpu.max" else _REAL_OPEN(p, *a, **k))
+
+
+def _as_bare_metal():
+    C.os.path.exists = _REAL_EXISTS
+    C.open = _REAL_OPEN
+
+
+try:
+    # 本机（非容器）行为不能受影响 —— 这是最容易碰坏的
+    _as_bare_metal()
+    check(C._in_container() is False, "非容器环境不该判为容器")
+    check(C._cgroup_cpu_limit() is None, "非容器环境不该读到 cgroup 限额")
+
+    # cgroup v2：2 核
+    _as_container("200000 100000")
+    check(C._in_container() is True, "有 cpu.max 应判为容器")
+    check(C._cgroup_cpu_limit() == 2.0, f"v2 应解析成 2.0，实得 {C._cgroup_cpu_limit()}")
+    check(C._effective_cores() == 2, f"2 核限额的有效核应是 2，实得 {C._effective_cores()}")
+    check(C.load1() is None,
+          "容器内 load1 必须返回 None —— 宿主机负载与容器无关，"
+          "拿它判过载会让容器空转")
+    _n = C.dynamic_workers(2, 12)
+    check(2 <= _n <= 12, f"容器内并发必须落在上下限内，实得 {_n}")
+
+    # v2 的 `max` 表示不限额 → 按裸机处理
+    _as_container("max 100000")
+    check(C._cgroup_cpu_limit() is None, "v2 'max' 是不限额，应返回 None")
+
+    # 小数限额向上取整
+    _as_container("150000 100000")
+    check(C._cgroup_cpu_limit() == 1.5, "应解析成 1.5")
+    check(C._effective_cores() == 2,
+          f"1.5 核应向上取整为 2（1 核跑不动 IO 重叠），实得 {C._effective_cores()}")
+
+    # 4 核
+    _as_container("400000 100000")
+    check(C._effective_cores() == 4, f"4 核限额，实得 {C._effective_cores()}")
+
+    # 极端：限额极小也不能返回 0
+    _as_container("50000 100000")
+    check(C._effective_cores() >= 1, "0.5 核也不能返回 0（会死锁）")
+finally:
+    _as_bare_metal()
+    import shutil
+    shutil.rmtree(_TD, ignore_errors=True)
 
 print(f"ALL PASS (动态并发 {_ok} 个断言)")

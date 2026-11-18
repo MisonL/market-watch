@@ -88,6 +88,52 @@ def _launchctl(*args, **kw):
     return _subprocess.run([_bin, *args], **kw)
 
 
+def _scheduler_alive():
+    """容器调度器是否在跑（判「没有 launchd」是环境不适用还是真故障）。
+
+    ⚠️ 为什么需要它：容器里没有 launchd，`_launchctl("list")` 抛
+    FileNotFoundError。此时有两种截然不同的情况，**日志表现一样、含义完全相反**：
+
+      · 容器部署（scheduler.py 在跑）→ 环境不适用，程序是健康的
+      · 谁也没在调度（scheduler 也没跑）→ **真故障**，一行推送都不会发
+
+    不区分的话，前者天天报假红把后者淹掉。
+    """
+    # ① PID 文件（首选）：不依赖任何外部命令。
+    # ⚠️ 最初用 `pgrep -f src/scheduler.py`，但 `[实测]` 2026-11-18：
+    # `python:3.12-slim` **不含 procps**，容器里 `pgrep: not found`
+    # → 永远判成"没在跑" → 本该静默的项变成假红。
+    _pf = os.path.join(DIR, "state", "scheduler.pid")
+    try:
+        with open(_pf, encoding="utf-8") as _f:
+            _pid = int(_f.read().strip())
+        if _pid > 0:
+            os.kill(_pid, 0)          # 只探活，不发信号
+            # Linux 上再核一次 cmdline，防 PID 被别的进程复用后误判
+            try:
+                with open(f"/proc/{_pid}/cmdline", "rb") as _c:
+                    if b"scheduler.py" in _c.read():
+                        return True
+            except FileNotFoundError:
+                return False
+            except OSError:
+                # 无 /proc（macOS）→ 上面 kill(0) 成功即认为存活
+                return True
+            # 有 /proc 但 cmdline 不含 scheduler.py → PID 被复用，不算
+            return False
+    except Exception:
+        pass
+
+    # ② 兜底：环境里有 pgrep 时再试一次（老版本遗留的部署没有 PID 文件）
+    try:
+        import subprocess as _sp_sa
+        _r = _sp_sa.run(["pgrep", "-f", "src/scheduler.py"],
+                        capture_output=True, text=True, timeout=5)
+        return bool(_r.stdout.strip())
+    except Exception:
+        return False
+
+
 def _boot_age_s():
     """系统启动至今的秒数；取不到返回 None。
 
@@ -14963,6 +15009,31 @@ def _main(ok_all):
     try:
         _out = _launchctl("list", capture_output=True,
                               text=True, timeout=30).stdout
+    except FileNotFoundError as e:
+        # ⚠️⚠️ 容器部署（无 launchd）：这是**环境不适用**，不是故障。
+        #
+        # 判据取「调度器在不在跑」而不是「有没有 launchctl」—— 前者才是
+        # "这份部署有没有人调度"的真正答案。`src/scheduler.py` 在容器里
+        # 接管全部定时任务。
+        #
+        # 为什么必须显式区分：不区分的话，用户第一次 `docker compose up`
+        # 就看到一整片 ❌，但程序其实是好的。假红会把真故障淹没，
+        # 也会让人怀疑整个迁移方案。
+        #
+        # ⚠️ 但也**不能**当成 ✅ —— 那等于"什么都没查就宣告健康"。
+        # 归到 `_unverified`：既不是通过也不是失败。
+        _out = ""
+        if _scheduler_alive():
+            print("  ⏭️ 不适用：无 launchd（容器部署）—— "
+                  "调度由 src/scheduler.py 接管")
+            print("     launchd 专有判据（plist 一致性 / StartInterval 对账）"
+                  "在本部署下无意义（本轮未验证）")
+            _unverified[0] += 1
+        else:
+            print(f"  ❌ launchctl list 失败且**找不到调度器**：{e}")
+            print("     既没有 launchd、也没有 src/scheduler.py 在跑 —— "
+                  "这份部署没有任何东西在触发定时任务")
+            ok_all = False
     except Exception as e:
         _out = ""; print(f"  ❌ launchctl list 失败: {e}"); ok_all = False
     if _out:

@@ -51,12 +51,17 @@ src/            源码
   paths.py        路径真值源
   selfcheck.py    自检（健康检查 + 契约校验）
   selfcheck_mutation.py  变异测试（注入缺陷，验证自检能否抓住）
+  concurrency.py  并发度自适应（含 cgroup 感知）
+  scheduler.py    容器/无 launchd 环境的调度器
 conf/           配置
   config.json         主配置（含 webhook，**不入库**）
   config.example.json 主配置模板
   sectors.json        监控板块与阈值
   plan.example.md     注入 AI 的市场语境模板
 tests/          测试
+docker/         容器入口
+Dockerfile      镜像定义
+docker-compose.yml  编排示例
 ```
 
 ---
@@ -117,13 +122,51 @@ bash tests/run_all.sh
 **标签前缀可配置**：默认 `com.mison.market*`，用环境变量
 `MW_LAUNCHD_PREFIX` 改成你自己的。
 
+### 5. 常驻（Docker / Linux）
+
+容器里**没有 launchd**，调度改由 `src/scheduler.py` 接管。它复现了
+launchd 的两条隐式语义：
+
+- **同一 job 不并发** —— 上一轮没结束就跳过本轮（`analyze` 慢轮能跑十几分钟）
+- **webui 常驻 + 退避重启** —— 挂了按 5→10→…→300s 退避，不会疯狂重启刷日志
+
+```bash
+cp conf/config.example.json conf/config.json   # 填 webhook
+cp conf/plan.example.md     conf/plan.md       # 填市场判断
+docker compose up -d
+docker compose logs -f
+```
+
+⚠️ **时区必须显式给 `TZ=Asia/Shanghai`。** 容器默认 UTC，而这个程序的一切
+时段判断（09:25/10:00/…/15:00、盘中盘前、`plan.md` 新鲜度）都基于北京时间。
+设错的后果**不是报错**，是"能跑但全错"—— 盘中不推、半夜推。
+`scheduler.py` 会在启动时校验实际偏移，不是 UTC+8 就 `exit 2`。
+
+三个配置文件的区别：
+
+| 文件 | 进镜像？ | 原因 |
+|---|---|---|
+| `conf/sectors.json` | ✅ | 无可执行凭据，是公开的板块与阈值定义 |
+| `conf/config.json` | ❌ 挂载 | 含 webhook key —— 进了镜像层就删不掉 |
+| `conf/plan.md` | ❌ 挂载 | 个人交易计划 |
+
+**面板访问**：`webui` 无认证（设计前提是"本机即信任边界"），且
+**绑非回环地址时会拒绝启动**。compose 里容器内绑 `0.0.0.0`（否则端口映射
+进不来）、但只把它映射到宿主机 `127.0.0.1`，边界由端口前缀守住。
+
+**容器里自检会显示几项 ❌，这是预期内的**：
+`claude CLI` / `firecrawl CLI` 未安装（AI 摘要会退化成模板兜底、最后一级
+取数兜底不可用）、以及全新卷上 `history/*.jsonl` 还不存在（跑一轮就有了）。
+`[定时任务]` 一项会显示 `⏭️ 不适用` —— 那是**标记为未验证**，既不算通过
+也不算故障。
+
 ---
 
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MW_DIR` | `~/.market-watch` | 数据根目录 |
+| `MW_DIR` | `~/.market-watch` | 数据根目录（容器里设 `/app`） |
 | `MW_PROXY` | 空（禁用） | 代理地址，如 `http://127.0.0.1:7890` |
 | `MW_LAUNCHD_PREFIX` | `com.mison.market` | launchd 标签前缀 |
 | `MW_FULL` | — | 变异测试强制全量 |
@@ -132,6 +175,9 @@ bash tests/run_all.sh
 | `MW_TEST_JOBS` | 动态 | 单元测试并行度（**IO 密集型**；不设则按实测吞吐自适应 4~12 路） |
 | `MW_SKIP_AI_PROBE` | — | 跳过 AI 探活（离线自检用） |
 | `MW_NO_LOCK` | — | 跳过 run 锁（仅调试） |
+| `MW_HOST` | `127.0.0.1` | webui 监听地址（容器里需 `0.0.0.0`） |
+| `MW_HOST_ALLOW_REMOTE` | — | 允许 webui 绑非回环地址（它无认证，慎用） |
+| `MW_PORT` | `8787` | webui 端口 |
 
 ---
 

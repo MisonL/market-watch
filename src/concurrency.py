@@ -59,11 +59,67 @@ import os
 _WORKER_PER_EFFECTIVE_CORE = 1
 
 
-def _effective_cores():
-    """有效核数：逻辑核数 // 2（超线程折算），至少 1。
+def _in_container():
+    """是否跑在容器里（Docker / Podman / k8s 都满足其一）。
 
-    `os.cpu_count()` 在某些容器里返回 None —— 那就不折半，直接当 1 个用。
+    判据取"有没有 cgroup 限额文件"，而不是 `/.dockerenv`：
+    后者只覆盖 Docker，k8s 的 containerd 容器就没有；而 cgroup 文件
+    在两种运行时都有（v1 / v2 任一）。
     """
+    for _p in ("/sys/fs/cgroup/cpu.max",                    # cgroup v2
+               "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):      # cgroup v1
+        if os.path.exists(_p):
+            return True
+    return False
+
+
+def _cgroup_cpu_limit():
+    """容器被允许用几个 CPU（可带小数）；读不到返回 None。
+
+    ⚠️⚠️ 2026-11-18（Docker 部署）：**容器里 `os.cpu_count()` 返回的是
+    宿主机核数，不是容器限额**。`--cpus=2` 跑在 16 核机器上照样报 16，
+    于是并发度按 16 核算 → 一次开十几个 worker，全部在 2 个核上抢 CPU，
+    比串行还慢。
+
+    cgroup v2 的 `cpu.max` 形如 `200000 100000`（配额/周期）或 `max 100000`；
+    v1 用两个文件 `cfs_quota_us` / `cfs_period_us`。两者都按
+    `quota / period` 折成核数。
+    """
+    # ---- cgroup v2 ----
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as _f:
+            _parts = _f.read().split()
+        if len(_parts) >= 2 and _parts[0] != "max":
+            _q, _p = float(_parts[0]), float(_parts[1])
+            if _q > 0 and _p > 0:
+                return _q / _p
+    except Exception:
+        pass
+    # ---- cgroup v1 ----
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as _f:
+            _q = float(_f.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as _f:
+            _p = float(_f.read().strip())
+        # v1 用 -1 表示"不限额"
+        if _q > 0 and _p > 0:
+            return _q / _p
+    except Exception:
+        pass
+    return None
+
+
+def _effective_cores():
+    """有效核数：容器内按**限额**算，裸机按逻辑核 // 2（超线程折算）。
+
+    `os.cpu_count()` 在某些环境返回 None —— 那就不折半，直接当 1 个用。
+    """
+    _lim = _cgroup_cpu_limit()
+    if _lim is not None:
+        # 容器：限额就是硬上限，不再折半 —— cgroup 的 2 核本来就是实打实的
+        # 2 核，不像超线程那样两个逻辑核共用一个物理核。向上取整，
+        # 因为 1.5 核的限额至少还能跑 2 个 worker 的 IO 重叠。
+        return max(1, int(-(-_lim // 1)))
     try:
         n = os.cpu_count() or 0
     except Exception:
@@ -74,7 +130,20 @@ def _effective_cores():
 
 
 def load1():
-    """1 分钟负载；读不到返回 None（与 selfcheck 的 fail-closed 约定一致）。"""
+    """1 分钟负载；读不到返回 None（与 selfcheck 的 fail-closed 约定一致）。
+
+    ⚠️⚠️ 2026-11-18（Docker 部署）：**容器里这个值没有意义，返回 None**。
+
+    `os.getloadavg()` 读的是**宿主内核**的可运行队列长度，容器看不到自己的。
+    在一台 load 60~100 的宿主机上（本机实测常态，一台虚拟机占 428% CPU），
+    容器里的进程会以为自己过载 —— 而实际上 cgroup 给它的核是空的。
+
+    返回 None 不是"信息缺失"，是**这个指标在容器里不适用**。调用方
+    `dynamic_workers()` 对 None 的处理是"用下限、不冒进"，而真正的仲裁交给
+    `AdaptiveThrottle` —— 它量的是本进程组实际拿到多少 CPU，那是可靠的。
+    """
+    if _in_container():
+        return None
     try:
         return float(os.getloadavg()[0])
     except Exception:
@@ -101,8 +170,16 @@ def dynamic_workers(min_workers=1, max_workers=8, reserve=1.0):
     avail = _effective_cores()
     cur = load1()
     if cur is None:
-        # 读不到负载 → 用下限。**不知道有没有余量时不冒进** ——
-        # 宁可慢一点，也不要因为读不到指标就乐观开满、把别人的机器打死。
+        # 读不到负载时分两种情形：
+        #
+        # ① **容器内**（2026-11-18 加）：loadavg 读不到不等于没有余量 ——
+        #    容器有明确的 cgroup 限额，那个数就是可用的全部算力。
+        #    单元测试是 IO 密集型（实测 8 个 sleep 子进程 CPU 并发 0.9），
+        #    在限额内开满反而最快。所以按"限额 × 2"给，仍夹在上下限内。
+        # ② 裸机读不到 loadavg：真·不知道余量 → 退下限，不冒进。
+        if _in_container():
+            _cap = avail * 2
+            return max(min_workers, min(max_workers, _cap))
         # 运行时还有 `AdaptiveThrottle` 会根据实际吞吐往上调。
         return min_workers
 

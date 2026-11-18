@@ -1,0 +1,78 @@
+# market-watch —— 容器编排示例
+#
+# 用法：
+#   cp conf/config.example.json conf/config.json   # 填入 webhook
+#   cp conf/plan.example.md     conf/plan.md       # 填市场判断
+#   docker compose up -d
+#   docker compose logs -f
+#
+# ## 为什么 conf/ 是挂载而不是打进镜像
+#
+# `conf/config.json` 里有企业微信 webhook 的 key，`conf/plan.md` 是个人交易
+# 计划。两者都不该进镜像层 —— 镜像会被推送到 registry、被缓存、被 `docker save`
+# 导出，层里的文件删不掉（只能新增一层 whiteout 遮住，原内容仍在）。
+services:
+  market-watch:
+    build: .
+    image: market-watch:latest
+    container_name: market-watch
+    restart: unless-stopped
+
+    # ⚠️ 时区必须显式给。容器默认 UTC，而这个程序的一切时段判断
+    # （09:25/10:00/…/15:00、盘中盘前、plan 新鲜度）都基于北京时间。
+    # 设错的后果不是报错，是"能跑但全错"—— 盘中不推、半夜推。
+    environment:
+      TZ: Asia/Shanghai
+      # webui 监听地址：容器外要访问就必须 0.0.0.0
+      #
+      # ⚠️⚠️ webui **没有认证** —— 它的设计前提是"本机即信任边界"，
+      # 只绑 127.0.0.1，且**绑非回环地址时会拒绝启动**：
+      #
+      #     拒绝启动：MW_HOST='0.0.0.0' 不是回环地址，而面板无鉴权。
+      #     如确实需对外提供，请同时设 MW_HOST_ALLOW_REMOTE=1 …
+      #
+      # 这个闸门是对的，别为了"让面板能从外面打开"就无脑加
+      # MW_HOST_ALLOW_REMOTE=1 —— 面板会显示**推送正文与持仓口径**。
+      #
+      # 容器里的正确做法：容器内仍绑 0.0.0.0（否则端口映射进不来），
+      # 但**只在宿主机回环上映射**（见下面 ports 的 127.0.0.1: 前缀）。
+      # 这样外部访问不到，只有本机能开 http://127.0.0.1:8787。
+      #
+      # ⚠️ 注意：闸门判的是**监听地址**不是"谁在连"，所以容器内绑 0.0.0.0
+      # 仍必须显式开 MW_HOST_ALLOW_REMOTE=1。这里开它是**安全的**，
+      # 因为真正的边界由 ports 的 127.0.0.1: 前缀守住。
+      MW_HOST: 0.0.0.0
+      MW_HOST_ALLOW_REMOTE: "1"
+      MW_PORT: "8787"
+      # 代理：需要经代理访问行情源时才设（留空=禁用）
+      # MW_PROXY: "http://host.docker.internal:7890"
+
+    volumes:
+      # 配置（只读挂载：程序不需要改它，减少误写面）
+      - ./conf:/app/conf:ro
+      # 状态与日志（可写）。state/ 里有去重与推送记账，**丢了会重复推送**，
+      # 所以这两个必须落在持久卷上，不能用匿名卷。
+      - ./state:/app/state
+      - ./logs:/app/logs
+
+    ports:
+      # 只映射到宿主机回环 —— 配合 webui 无认证的设计
+      - "127.0.0.1:8787:8787"
+
+    # 容器内是 UID 10001。若宿主目录所有者不同，用下面两种之一对齐：
+    #   user: "10001:10001"   （默认，需要宿主目录 chown）
+    #   user: "${UID}:${GID}" （让容器以当前用户跑，最简单）
+    # ⚠️ 用 10001 而不 root：state/ 里是行情与推送记账，不需要任何系统权限。
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/api/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # ⚠️ 优雅停止要看调度器/子进程能多快收手。
+    # analyze 一轮可能跑十几分钟（慢轮实测 241s，AI 超时能到 1800s），
+    # 但 scheduler 收到 SIGTERM 会转成 SIGTERM 给整组（不是 SIGKILL 直杀），
+    # 子进程会走自己的收尾（回滚 inflight、落 state）。
+    # 给 30 秒：足够正常收尾；再长会让 `docker compose down` 卡着。
+    stop_grace_period: 30s
