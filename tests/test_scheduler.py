@@ -144,4 +144,45 @@ check(S.EXPLICIT_TZ == "Asia/Shanghai",
       "`CST` 在 macOS 上能用，但在 Linux/glibc 下有歧义（可能是美国中部时间）")
 
 
+
+# ---------------------------------------------------------------- 记忆长度契约
+#
+# ⚠️⚠️ 这条判据守的是一个**真实发生过、长期丢数据**的缺陷形态：
+# 工具 schema 的 `maxLength` 与函数体里的截断阈值必须**一致地**设置 ——
+# schema 卡在 600、函数体也写 600 时，schema 先在进入函数体之前把超长输入
+# 拒掉，函数体里那行 `if len(text) > 600: text = text[:597]+"…"` 是
+# **永远执行不到的死代码**。
+#
+# 后果不是"少截了几个字"，而是：模型写长了 → 整条被拒 → 重写 → 重写的
+# 那条通常丢掉「明日观察点」→ 次日「昨日判断验证」段无料可验。
+# `[实测]` 2026-11-19 复核 7 次历史会话，**9 次**提交超 600、全部被拒；
+# 2026-11-18 那轮重写没来得及发出，`memory.md` 至今缺一整天。
+def _check_memory_contract():
+    _p = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "agent", "src", "mw_agent", "__main__.py")
+    try:
+        _src = open(_p, encoding="utf-8").read()
+    except OSError:
+        return          # agent/ 是独立仓库，clone 里没有 → 跳过（不误报）
+    import re as _re_mc
+    # schema：append_memory 的 text.maxLength
+    _m1 = _re_mc.search(
+        r'"text":\s*\{[^}]*"maxLength":\s*(\d+)[^}]*"description":\s*"记忆正文', _src)
+    # 函数体：if len(text) > N: text = text[:M] + "…"
+    _m2 = _re_mc.search(r"if len\(text\)\s*>\s*(\d+):\s*\n\s*text = text\[:(\d+)\]", _src)
+    if not (_m1 and _m2):
+        check(False, "找不到 append_memory 的 schema 上限或截断阈值 —— "
+                     "判据失效（改了写法请同步更新本测试）")
+    _schema = int(_m1.group(1))
+    _cut, _keep = int(_m2.group(1)), int(_m2.group(2))
+    check(_schema > _cut,
+          f"append_memory 的 schema maxLength({_schema}) 必须**大于**函数体截断阈值"
+          f"({_cut}) —— 否则 schema 会先拒掉超长输入，"
+          f"函数体里的截断分支是永远执行不到的死代码")
+    check(_keep < _cut,
+          f"截断保留长度({_keep}) 必须小于阈值({_cut})，否则加不下省略号")
+
+
+_check_memory_contract()
+
 print(f"ALL PASS (容器调度器 {_ok[0]} 个断言)")
