@@ -1554,6 +1554,36 @@ DEAD_HOST_FILE = p_cache("dead_hosts.json")
 # （原注释担心的白烧 curl），又不会把一次抖动放大成 30 分钟盲区。
 DEAD_TTL = 300
 
+# ⚠️⚠️ 2026-11-18（按本机实测数据加的指数退避）：
+#
+# 固定 300s 的代价，在**长期不可用**的主机上会变成纯噪音。本机实测：
+#
+#     主机            半开探测次数   探测后真的恢复
+#     push2test(em_test)    30            0*      ← 一整天都在空探
+#     push2                 32            8
+#
+# (*) em_test 在 11-17 11:01 之后**再没顶上过**，但每 5 分钟仍探一次，
+#     于是 watch.log 里整天是「半开探测：push2test … 冷却期已过」。
+#     这些行对诊断毫无价值 —— 它说的只是"又试了一次，又失败了"。
+#
+# 更糟的是**它掩盖了真信号**：11-17 那次事故（TTL 30 分钟导致 6 轮数据盲区）
+# 之所以难查，就是因为日志里混着大量同形的空探行。
+#
+# 修法：**连续失败次数越多，冷却越久**（指数退避，封顶 1 小时）：
+#
+#     第 1 次判死 → 300s     （5 分钟，与原来一致：瞬时抖动要能快速恢复）
+#     第 2 次      → 600s    （10 分钟）
+#     第 3 次      → 1200s   （20 分钟）
+#     第 4 次及以后 → 3600s   （1 小时，封顶）
+#
+# 为什么第 1 次不变：绝大多数"死"是瞬时抖动（本机 push2 探测 32 次恢复 8 次
+# = 25%），第一次必须保持灵敏。退避只惩罚**反复失败**的主机。
+#
+# 上限 1 小时而不是更长：站点解封后最多等 1 小时就能被重新启用，
+# 不会像 PERMANENTLY_DEAD 那样要人工干预。
+_COOL_BASE = DEAD_TTL
+_COOL_CAP = 3600
+
 # **永久**封锁的主机：直连与所有兜底都不再尝试。
 #
 # 与 DEAD_TTL（临时判死、到期重试）的区别：这些主机是**按主机名**被目标
@@ -1645,7 +1675,14 @@ def _host_dead(host, half_open=True):
         # （feeds.FALLBACK_CACHE.ts 也加过，但该死链已于 2026-10-09 删除）。
         if not isnum(ts):
             ts = 0
-        if time.time() - ts < DEAD_TTL:
+        # 指数退避：按该主机的**连续失败次数**决定冷却期（见 _COOL_BASE 的注释）。
+        # 次数存在 `主机#n` 键里，与时间戳分开 —— 这样 DEAD_HOST_FILE 的
+        # 既有读者（自检、webui）看到的仍然是 `{host: ts}` 的形状。
+        _n = d.get(host + "#n", 1)
+        if not isnum(_n) or _n < 1:
+            _n = 1
+        _cool = min(_COOL_CAP, _COOL_BASE * (2 ** (min(int(_n), 8) - 1)))
+        if time.time() - ts < _cool:
             return True
         # ---- 冷却期已过：半开探测 ----
         # 只对"真的死过"的主机走这条路（ts>0）；从未失败过的主机不该被
@@ -1656,7 +1693,11 @@ def _host_dead(host, half_open=True):
                 # 不再重复发包。下一轮进程重启时集合清空，自然再探一次。
                 return True
             _HALF_OPEN_TRIED.add(host)
-            log(f"半开探测：{host} 冷却期已过，本轮放行一次试探", "FEED")
+            # 带上连续失败次数：只有第 1 次值得关注（可能是瞬时抖动），
+            # 第 N 次（N≥3）说明这台已经长期不可用 —— 直接调大 DEAD_TTL
+            # 或把它加进 PERMANENTLY_DEAD 比反复探测更实际。
+            _tag = f"（连续失败 {int(_n)} 次，冷却 {_cool//60} 分钟）" if _n > 1 else ""
+            log(f"半开探测：{host} 冷却期已过，本轮放行一次试探{_tag}", "FEED")
             return False
     except Exception:
         pass
@@ -1698,10 +1739,19 @@ def _mark_dead(host):
     def _mu(d):
         # 顺手剪掉早已过期的条目，否则文件只增不减。
         # 非数值 ts（手工编辑/半截写入）一并清掉，否则 now - t 抛 TypeError。
+        # 注意跳过 `#n` 键：它存的是计数不是时间戳，按时间判会被误删。
         for h in [h for h, t in d.items()
-                  if not isnum(t) or now - t >= DEAD_TTL]:
+                  if not h.endswith("#n")
+                  and (not isnum(t) or now - t >= _COOL_CAP)]:
+            # 用 _COOL_CAP（1 小时）而不是 DEAD_TTL 清理：退避后条目可能
+            # 仍然有效，按 DEAD_TTL 清会把计数和短冷却的条目一起抹掉。
             del d[h]
         d[host] = now
+        # 累加连续失败次数（供上面的指数退避用）。
+        _prev = d.get(host + "#n", 0)
+        if not isnum(_prev) or _prev < 0:
+            _prev = 0
+        d[host + "#n"] = int(_prev) + 1
         return True
     if _locked_update(DEAD_HOST_FILE, _mu):
         pass
@@ -1715,10 +1765,14 @@ def _mark_dead(host):
 
 def _clear_dead(host):
     def _mu(d):
-        if host in d:
-            del d[host]
-            return True
-        return False
+        _hit = False
+        # 恢复后必须**连次数一起清零** —— 否则这台下次再挂，
+        # 会直接从"第 N 次"的 1 小时冷却开始，白白错过快速恢复。
+        for _k in (host, host + "#n"):
+            if _k in d:
+                del d[_k]
+                _hit = True
+        return _hit
     _locked_update(DEAD_HOST_FILE, _mu)
 
 # ---------- 网络异常备用方案：firecrawl 云端抓取 ----------
