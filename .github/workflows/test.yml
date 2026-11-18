@@ -1,0 +1,95 @@
+name: test
+
+# 每次 push 到 main、以及每个 PR，跑单元测试 + 锚点完整性。
+#
+# ## 为什么 CI 里跑这两项（而不是自检/变异测试）
+#
+# | 检查 | 耗时 | 进 CI？ | 理由 |
+# |---|---|---|---|
+# | 单元测试 `run_all.sh` | ~20~40s | ✅ | 快、确定性高、覆盖各层判据 |
+# | 锚点完整性 | ~2s | ✅ | **改源码忘了同步变异体锚点时抓得住** |
+# | 自检 `selfcheck.py` | 1~3 分钟 | ⚠️ 不跑 | 它检查的是**这台机器**的运行时状态
+# | | | | （launchd 任务、日志新鲜度、AI CLI 在位）—— 在 runner 上必然一片红，
+# | | | | 而红的原因与代码质量无关 |
+# | 变异测试 | 1~2 小时 | ❌ 不跑 | 太慢、且要真跑 selfcheck 子进程 |
+#
+# 自检和变异测试是**本机发布前**的门槛（见 CONTRIBUTING.md），不是 CI 的活。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 是声明的最低版本（`typing.NotRequired`），
+        # 加上最新稳定版，确保两头都过
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 语法检查（全部源码与测试）
+        run: |
+          python -m compileall -q src tests
+          echo "✅ 全部可编译"
+
+      - name: 锚点完整性
+        # 379 条变异体的注入锚必须都能在源码里**逐字**找到。
+        # 改源码忘了同步锚点 → 全量回归会静默变成"假漏网"，
+        # 而这个检查只要 2 秒就能发现。
+        run: python tests/test_anchor_integrity.py
+
+      - name: 单元测试
+        # ⚠️ MW_TEST_JOBS 刻意设 4：
+        #   · 本仓库的 `src/concurrency.py` 会按**实测吞吐**自适应并发，
+        #     但 GitHub runner 只有 2~4 核、且是共享的，
+        #     自适应在 40 秒的任务里来不及收敛，反而可能开太多把 runner 拖垮
+        #   · 显式指定 = 不猜（`resolve_workers` 的约定：环境变量永远优先）
+        env:
+          MW_TEST_JOBS: "4"
+          PYTHONDONTWRITEBYTECODE: "1"
+        # ⚠️ `run_all.sh` 的返回码语义（见其文件尾）：
+        #     0 = 全过
+        #     1 = 有失败（真问题）
+        #     2 = 全过但有**跳过**（跳过不算验证过）
+        #
+        # 这个设计是对的 —— 本机跑时 SKIP 必须让人看见。
+        # 但在 CI 里，"跳过"的固定原因是 `agent/.venv` 不存在
+        # （`agent/` 是独立仓库、已在本仓库 .gitignore 里，克隆后必然没有），
+        # 那是**环境差异不是代码缺陷**，不该让 CI 变红。
+        #
+        # 所以这里接受 0 和 2，但把跳过数打印出来 —— 不能因为"不让 CI 红"
+        # 就把跳过的事实藏掉。rc=1（真失败）仍然让 job 失败。
+        run: |
+          set +e
+          bash tests/run_all.sh
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "✅ 全部通过"
+          elif [ "$rc" -eq 2 ]; then
+            echo "::warning::有测试被跳过（CI 环境缺 agent/.venv，属预期）—— 见上方输出"
+          else
+            echo "::error::测试失败 rc=$rc"
+            exit "$rc"
+          fi
+
+      - name: 失败时留档
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-py${{ matrix.python-version }}
+          path: |
+            tests/*.log
+          if-no-files-found: ignore
+          retention-days: 7
