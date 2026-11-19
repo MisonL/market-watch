@@ -59,6 +59,10 @@ try:
     # ---------- 冷却期逐次翻倍 ----------
     _seen = []
     for _i in range(1, 7):
+        # ⚠️ 每次 `_round_begin()` 代表"新的一轮取数"（launchd 每轮起新进程）。
+        # `#n` 的语义是**跨轮**连续失败，不是"调用次数" —— 见 `_mark_dead`
+        # 的 P1 注释：一轮内 12 个板块逐个失败只该算 1 次。
+        M._round_begin()
         M._mark_dead(_H)
         _d = json.load(open(M.DEAD_HOST_FILE, encoding="utf-8"))
         _n = _d.get(_H + "#n", 0)
@@ -89,6 +93,7 @@ try:
     check(_H + "#n" not in _d,
           "恢复后**计数也必须清除** —— 否则下次再挂会直接从长冷却起步")
 
+    M._round_begin()
     M._mark_dead(_H)
     _d = json.load(open(M.DEAD_HOST_FILE, encoding="utf-8"))
     check(_d.get(_H + "#n") == 1,
@@ -130,6 +135,29 @@ try:
     M._HALF_OPEN_TRIED.clear()
     check(M._host_dead(_H) is False,
           "计数=1 时冷却 300s；过了 350s 应放行探测（与上一条对照）")
+
+    # ---------- 同一轮内重复失败**不得**累加计数 ----------
+    #
+    # ⚠️⚠️ 2026-11-19（P1）：`#n` 语义是「跨**轮**连续失败」，但原实现
+    # 每调一次 `_mark_dead()` 就 +1。而一轮 `quotes()` 里同一台主机会被
+    # 判死多次（9 个指数 + 12 个板块逐个取，每个失败都算一次）。
+    # `[实测]` 沙箱：一轮 quotes() 全失败 → `_mark_dead` 共 9 次，
+    # push2(https) 计 3 次 → n 从 0 直接跳到 3（冷却 1200s，跳过前两档）。
+    # 两轮就封顶 3600s —— 这正是生产 13:06 清零后 13:20 又爬回 n=8 的原因。
+    M._round_begin()
+    with open(M.DEAD_HOST_FILE, "w", encoding="utf-8") as _f:
+        json.dump({}, _f)
+    for _i in range(5):
+        M._mark_dead(_H)                    # 同一轮内连失 5 次
+    _d = json.load(open(M.DEAD_HOST_FILE, encoding="utf-8"))
+    check(_d.get(_H + "#n") == 1,
+          f"同一轮内连失 5 次只应计 1 次，实得 {_d.get(_H + '#n')}")
+    # 跨轮则必须正常累加
+    M._round_begin()
+    M._mark_dead(_H)
+    _d = json.load(open(M.DEAD_HOST_FILE, encoding="utf-8"))
+    check(_d.get(_H + "#n") == 2,
+          f"进入新一轮后再失应累加到 2，实得 {_d.get(_H + '#n')}")
 
     # ---------- 排序函数**不得消费**半开探测令牌 ----------
     #

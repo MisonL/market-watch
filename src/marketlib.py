@@ -1706,6 +1706,27 @@ def _host_dead(host, half_open=True):
         pass
     return False
 
+# 本轮已计过失败的主机（见 `_mark_dead` 的 P1 说明）。
+# 一轮 = 一次顶层 `quotes()` 的生命周期，由 `_round_begin()` 清空。
+# 为什么必须是进程级可变集合而不是参数传递：`_mark_dead()` 的调用点
+# 分散在 `cj()` / `_try_hosts()` / 港股/QDII 备用源里，逐层传参要改
+# 5 个函数签名；而这个集合的语义就是"本进程本轮"，与 `_HALF_OPEN_TRIED`
+# 完全同族（那个也是进程级）。
+_MARK_ROUND = set()
+
+def _round_begin():
+    """开始新一轮取数：重置所有"本轮内一次性"的状态。
+
+    ⚠️ 只该由**顶层取数入口**调用（`quotes()` / `hk_quotes()`）。
+    嵌套调用重复清空是安全的（幂等），但会让外层的"已计过"记录丢失 ——
+    所以入口处判一次就够了，不要在中层函数里调。
+    """
+    _MARK_ROUND.clear()
+    try:
+        _HALF_OPEN_TRIED.clear()
+    except Exception:
+        pass
+
 def _mark_dead(host):
     # ⚠️⚠️ **手工验证这道状态机时，先把状态重定向到 /tmp。**
     # `[实测]` 2026-11-17：为验证半开探测，直接在脚本里调
@@ -1766,11 +1787,33 @@ def _mark_dead(host):
                 except KeyError:
                     pass
         d[host] = now
-        # 累加连续失败次数（供上面的指数退避用）。
+        # ── 累加跨轮连续失败次数（供上面的指数退避用）──
+        #
+        # ⚠️⚠️ 2026-11-19（P1，退避被放大 3~5 倍）：**同一轮内不重复计数**。
+        #
+        # `#n` 的语义是「跨**轮**连续失败的轮次数」（见 1575 行的设计注释：
+        # 第 1 轮 300s、第 2 轮 600s…），但原实现每调一次 `_mark_dead()`
+        # 就 +1。而一轮 `quotes()` 里同一台主机会被判死**多次** ——
+        # 9 个指数、12 个板块逐个取，每个标的失败都 `_mark_dead()` 一次。
+        #
+        # `[实测]` 沙箱（直连/代理/firecrawl 全置为必失败）：
+        #     一轮 quotes() → _mark_dead 共 **9 次**
+        #     push2(https) 计 3 次 → n 从 0 直接跳到 3（冷却 1200s，跳过前两档）
+        # 两轮就封顶 3600s。这正是生产 13:06（手工清零后）到 13:20
+        # 又爬回 n=8 的全过程 —— 主机只抖了一轮，却被当成"连续 3~5 轮失败"。
+        #
+        # 反过来也说明另一件事：**原设计里那个"连续"是假的**。它数的是
+        # "失败请求数"，与"连续失败轮数"在标的数量多时相差一个数量级。
         _prev = d.get(host + "#n", 0)
         if not isnum(_prev) or _prev < 0:
             _prev = 0
-        d[host + "#n"] = int(_prev) + 1
+        if host in _MARK_ROUND:
+            # 本轮已计过：只把时间戳刷新到最新（冷却从**最后一次**失败算起，
+            # 这是对的 —— 否则一轮内先失败的主机会提前解锁）。
+            d[host + "#n"] = int(_prev)
+        else:
+            _MARK_ROUND.add(host)
+            d[host + "#n"] = int(_prev) + 1
         return True
     if _locked_update(DEAD_HOST_FILE, _mu):
         pass
@@ -3734,6 +3777,12 @@ def quotes(ids, fields="f2,f3,f6,f12,f14,f24,f62,f104,f105,f184",
     A股与板块：主源 → EM_TEST → 腾讯/新浪等。
     返回 {代码: row}
     """
+    # ⚠️ 新一轮开始：重置"本轮已计过失败的主机"与半开探测令牌。
+    # 必须在这里（而不是 `_mark_dead` 里）—— 本函数是**顶层取数入口**，
+    # collect/analyze 每轮各调它若干次。放在这里意味着"一轮 = 一次
+    # quotes() 调用"：同一次调用里 12 个板块逐个失败只算 **1 次**，
+    # 而不是 12 次（那会把指数退避放大一个数量级，见 `_mark_dead` 的注释）。
+    _round_begin()
     ids = list(ids)
     hk  = [i for i in ids if _is_hk(i)]
     a   = [i for i in ids if not _is_hk(i)]
