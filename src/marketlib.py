@@ -1749,6 +1749,22 @@ def _mark_dead(host):
             # 用 _COOL_CAP（1 小时）而不是 DEAD_TTL 清理：退避后条目可能
             # 仍然有效，按 DEAD_TTL 清会把计数和短冷却的条目一起抹掉。
             del d[h]
+            # ⚠️⚠️ 2026-11-19：**必须连计数一起删**，否则留下孤儿键。
+            #
+            # 原先只 `del d[h]`，`h#n` 永远不被清理 —— `[实测]` 沙箱复现：
+            #     造 {old.host: 2小时前, old.host#n: 8} → 触发一次清理后
+            #     剩 {new.host, new.host#n, old.host#n: 8}
+            # 孤儿键的后果不是"文件大了一点"，而是**退避从最坏档开始**：
+            # 这台主机下次再抖一次，`_mark_dead` 会把 8 加到 9，
+            # 一上来就是 60 分钟冷却 —— 而不是设计意图的 5 分钟。
+            # 也就是说：**历史上的失败会永久累积并拖累将来的恢复速度**，
+            # 这正好是"指数退避应当按'连续'失败计"的反面。
+            _nk = h + "#n"
+            if _nk in d:
+                try:
+                    del d[_nk]
+                except KeyError:
+                    pass
         d[host] = now
         # 累加连续失败次数（供上面的指数退避用）。
         _prev = d.get(host + "#n", 0)
@@ -3474,7 +3490,26 @@ def _ordered_em_hosts():
     def key(h):
         perm = 1 if _host_of(h) in PERMANENTLY_DEAD else 0
         # ⚠ 用 _host_key（含协议）：否则 HTTP 失败会把 HTTPS 候选一起排到末位
-        dead = 1 if _host_dead(_host_key(h)) else 0
+        # ⚠️⚠️ 2026-11-19（P0，生产事故）：排序**只读**判死状态，绝不触发半开探测。
+        #
+        # `_host_dead()` 有个隐藏副作用：冷却期过后它会**消费掉本轮唯一的
+        # 探测令牌**（`_HALF_OPEN_TRIED.add(host)`），返回 False 表示"放行"。
+        # 而排序函数每轮要调它 **5 次**（每台主机一次）—— 于是令牌在
+        # **排序阶段就被吃光**，等 `cj()` 真正要发包时那次判定已变成
+        # "本轮探过了，继续判死"，直连被跳过、直接砸到 firecrawl 兜底。
+        #
+        # `[实测]` 沙箱复现（n=7、冷却已过）：
+        #     不先排序 → _host_dead() = False（放行直连）
+        #     先排序后 → _host_dead() = True （直连被跳过，走兜底）
+        # 同一时刻、同一份状态，结论相反。
+        #
+        # 生产后果就是 2026-11-19 10:00 那条推送：板块 0/12 全灭，
+        # 「数据本轮不可用」。判死状态显示的 n 只增不减（7→8），
+        # 因为探测令牌每轮都被排序吃掉，直连永远没机会成功、`_clear_dead()`
+        # 永远不会被调用 —— 指数退避于是从 5 分钟一路爬到 60 分钟。
+        #
+        # 修法：排序用 `half_open=False`（纯读，不消费令牌）。
+        dead = 1 if _host_dead(_host_key(h), half_open=False) else 0
         rate, last_ok = _host_rate(_host_key(h))
         return (perm, dead, -rate, -last_ok)
     return sorted(EM_HOSTS, key=key)

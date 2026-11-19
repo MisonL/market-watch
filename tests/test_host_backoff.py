@@ -106,6 +106,14 @@ try:
     check("https://stale.invalid" not in _d,
           "远古时间戳的条目应被清理")
     check("https://other.invalid" in _d, "新判死的主机应写入")
+    # ⚠️⚠️ 2026-11-19（P0）：**孤儿计数键必须一起清**。
+    # 原实现只删 `host`，留下 `host#n: 8`。后果不是文件大一点 ——
+    # 这台主机下次再抖一次，计数会从 8 加到 9，一上来就是 60 分钟冷却，
+    # 而不是设计意图的 5 分钟。也就是说**历史失败永久拖累将来恢复**。
+    # `[实测]` 沙箱：造 {old: 2小时前, old#n: 8} → 触发清理后 old#n 仍在。
+    check("https://stale.invalid#n" not in _d,
+          "时间戳过期被清理时，**必须连 #n 计数一起删** —— "
+          "留下孤儿键会让该主机下次失败直接从最高档冷却起步")
 
     # ---------- _host_dead 认得出退避后的冷却期 ----------
     # 直接验：把时间戳设成"刚过 300s 但未过 600s"，计数=2 → 应仍判死。
@@ -122,6 +130,41 @@ try:
     M._HALF_OPEN_TRIED.clear()
     check(M._host_dead(_H) is False,
           "计数=1 时冷却 300s；过了 350s 应放行探测（与上一条对照）")
+
+    # ---------- 排序函数**不得消费**半开探测令牌 ----------
+    #
+    # ⚠️⚠️ 2026-11-19（P0 生产事故）：`_host_dead()` 冷却期过后会消费掉
+    # 本轮唯一的探测令牌（`_HALF_OPEN_TRIED.add`）表示"放行一次"。
+    # 而 `_ordered_em_hosts()` 每轮要对 5 台主机各调它一次 —— 令牌在
+    # **排序阶段就被吃光**，等 `cj()` 真正要发包时判定已变成
+    # "本轮探过了，继续判死"，直连被跳过、直接砸兜底。
+    #
+    # `[实测]` 沙箱：同一份状态（n=7、冷却已过）
+    #     不先排序 → _host_dead() = False（放行直连）
+    #     先排序后 → _host_dead() = True （直连被跳过）
+    # 生产后果：2026-11-19 10:00 板块 0/12 全灭、「数据本轮不可用」，
+    # 而判死计数只增不减（7→8→…）—— 因为直连永远没机会成功，
+    # `_clear_dead()` 永远不被调用，退避一路爬到 60 分钟。
+    # ⚠️ 必须用**真实在 EM_HOSTS 里**的主机 —— 否则 `_ordered_em_hosts()`
+    # 压根不会去看它，这个断言就成了空转（`[实测]` 第一版用的是
+    # `backoff-test.invalid`，注入缺陷后测试照样全绿，正是这个原因）。
+    _RH = M._host_key(M.EM_TEST)
+    _now3 = __import__("time").time()
+    with open(M.DEAD_HOST_FILE, "w", encoding="utf-8") as _f:
+        json.dump({_RH: _now3 - 3601, _RH + "#n": 7}, _f)
+    M._HALF_OPEN_TRIED.clear()
+    M._ordered_em_hosts()                    # 排序：只读，不该动令牌
+    check(_RH in [M._host_key(h) for h in M.EM_HOSTS],
+          "测试主机必须在 EM_HOSTS 里，否则本项是空转")
+    check(_RH not in M._HALF_OPEN_TRIED,
+          "排序函数**不得**消费半开探测令牌 —— "
+          f"否则直连永远轮不到发包，实得 {M._HALF_OPEN_TRIED}")
+    check(M._host_dead(_RH) is False,
+          "排序之后 _host_dead() 仍须**放行探测**（False）—— "
+          "排序函数不得消费探测令牌，否则直连永远轮不到")
+    # 反面：探测令牌用掉后，同一轮再判应返回 True（不重复发包）
+    check(M._host_dead(_RH) is True,
+          "探测令牌用掉后，同一轮再判应返回 True（继续判死，不重复发包）")
 
     # ---------- 形状兼容：既有读者只看 {host: ts} ----------
     _d = json.load(open(M.DEAD_HOST_FILE, encoding="utf-8"))
