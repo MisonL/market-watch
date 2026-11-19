@@ -6438,15 +6438,21 @@ def _drop_dangling_tail(t):
     _lines = t.rstrip().split("\n")
     _li = None
     for _i in range(len(_lines) - 1, -1, -1):
-        if _lines[_i].strip() and _lines[_i].strip() != "\u3000":
-            _li = _i
-            break
+        _st = _lines[_i].strip()
+        if not _st or _st == "\u3000":
+            continue
+        # 系统后缀（`> 触发 HH:MM · 耗时 Ns`、`> **标题**`）不是正文，跳过它
+        # 继续往前找。⚠️ `[实测]` 我第一版在这里直接 `return t` —— 于是
+        # 当文本**已经带了**时间戳（历史回放、二次调用）时判据整体失效，
+        # 残句照样留着。生产路径上 `_drop_dangling_tail` 跑在 `_fin()`
+        # 加戳之前，所以第一版碰不到；但「只有生产顺序才对」不是函数契约。
+        if _st.startswith(">"):
+            continue
+        _li = _i
+        break
     if _li is None:
         return t
     _tail = _lines[_li].rstrip()
-    # 系统后缀（`> 触发 HH:MM · 耗时 Ns`）不是正文，别碰
-    if _tail.startswith(">"):
-        return t
     if not _tail or _tail[-1] in "。）)%”』」！？…":
         return t
     # 走到这里：末行**没有句末标点** —— 正常正文几乎不会这样

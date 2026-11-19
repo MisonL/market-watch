@@ -94,6 +94,29 @@ try:
     check(all(ch in _cut or ch in "。" for ch in _r2),
           "只删不补 —— 不得补写任何原文没有的字")
 
+    # ---------- ③b 已带系统时间戳时同样要剔 ----------
+    # ⚠️ `[实测]` 我第一版见到末行是 `> 触发…` 就 `return t` —— 判据整体失效，
+    # 残句照样留着。生产路径上本函数跑在 `_fin()` 加戳**之前**，所以第一版
+    # 碰不到；但「只有生产调用顺序才对」不是函数契约，必须显式锁住。
+    _stamped = _cut + "\n\n　\n> 触发 14:49:51 · 耗时 245s"
+    _r2b = A._drop_dangling_tail(_stamped)
+    # ⚠️⚠️ 判据两处踩过坑，都记在这里：
+    #   ① 第一版只查 `[-1]`（末行是时间戳，当然不含残句）→ 断言恒绿，
+    #      注入缺陷后 19 条全过、缺陷漏网；
+    #   ② 第二版改成查整条文本 `"、CP" not in _r2b` → 更糟，因为正文里
+    #      本来就有断言串（句中是「亿、CP**O**」），子串匹配恒真。
+    # 正确判据：**去除系统耗时后缀后的最后一行**，必须不以残句收尾。
+    _body_tail = [x for x in _r2b.split("\n")
+                  if x.strip() and not x.strip().startswith(">")]
+    check(_body_tail and not _body_tail[-1].rstrip().endswith("CP"),
+          f"正文末行不得以残句「CP」收尾，实得 {_body_tail[-1][-16:]!r}"
+          if _body_tail else "正文末行不存在")
+    check(_body_tail and _body_tail[-1].rstrip().endswith(("。", "；")),
+          f"正文末行应以句末标点收尾，实得 {_body_tail[-1][-6:]!r}"
+          if _body_tail else "正文末行不存在")
+    check(_r2b.rstrip().endswith("耗时 245s"),
+          "系统时间戳必须原样保留在最后")
+
     # ---------- ④ 正常收尾不得误删 ----------
     for _good in ("**资金** 半导体 +20.7 亿，AI应用 -43.4 亿。",
                   "**关键位** 上证 3561.07（+0.02%）",
