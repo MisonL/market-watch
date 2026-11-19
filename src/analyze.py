@@ -6410,6 +6410,180 @@ _PLACEHOLDER_RE = re.compile(
     r"资金方向未提供|未提供)\s*[)）*]*\s*$")
 
 
+def _drop_dangling_tail(t):
+    """删掉末尾被截断的**残句碎片**（如「…转为 -2.23%、CP」）。
+
+    ## 为什么必须有这一道
+
+    AI 调用被预算闸门掐停时，`_invoke` 会「保留已产出的字符作为部分结果」
+    —— 这个取舍是对的（真实内容优于机械模板），但**切口落在哪里没有保证**：
+    它可能正好停在「、CP」这种半个词上。
+
+    `[实测]` 2026-11-19 14:53 那条推送的正文末尾：
+        …印制电路板自 12:13 的 -0.38% 转为 -2.23%、CP
+    读者看到的是一个悬空的「、CP」，会以为消息发重了或者截屏截断了。
+
+    ## 判据（只删不补）
+
+    末尾若以 `、` `；` `，` `:` `：` 结尾，或最后一个分句短于 4 字且
+    没有句末标点，就把最后一个分句整段丢掉 —— **不补写、不猜后续**。
+    宁可少说一句，也不能让读者读到半截话。
+
+    ⚠️ 只在**确实不完整**时动手：正常以 `。` `）` `%` 结尾的正文原样返回。
+    ⚠️ 幂等：删完再跑，结尾已是完整标点，不再命中。
+    """
+    if not t or not isinstance(t, str):
+        return t
+    # 去掉尾部空白与间隔行，定位真正的最后一行正文
+    _lines = t.rstrip().split("\n")
+    _li = None
+    for _i in range(len(_lines) - 1, -1, -1):
+        if _lines[_i].strip() and _lines[_i].strip() != "\u3000":
+            _li = _i
+            break
+    if _li is None:
+        return t
+    _tail = _lines[_li].rstrip()
+    # 系统后缀（`> 触发 HH:MM · 耗时 Ns`）不是正文，别碰
+    if _tail.startswith(">"):
+        return t
+    if not _tail or _tail[-1] in "。）)%”』」！？…":
+        return t
+    # 走到这里：末行**没有句末标点** —— 正常正文几乎不会这样
+    # （`_norm_*` 产出的行都以「。」或「）」收尾）。这是截断的最强信号。
+    #
+    # ⚠️ `[实测]` 我第一版只判「末字符是不是分隔标点」，而真实残句是
+    #      「…转为 -2.23%、CP」——末字符是字母 `P`，判据直接漏过。
+    # 判据改为：末行无句末标点 → 从后往前找最后一个完整的句子边界。
+    _dropped = ""
+    _cut = max(_tail.rfind("。"), _tail.rfind("；"), _tail.rfind(";"))
+    if _cut >= 0 and _cut >= len(_tail) // 2:
+        # 后半段没有句号 → 整段都是残的，砍掉
+        _dropped = _tail[_cut + 1:]
+        _lines[_li] = _tail[:_cut + 1]
+    elif _cut < 0:
+        # 整行都没有句末标点：再往前找「、」「，」这种分句边界
+        _c2 = max(_tail.rfind("、"), _tail.rfind("，"), _tail.rfind(","))
+        if _c2 > len(_tail) // 2:
+            _dropped = _tail[_c2 + 1:]
+            _lines[_li] = _tail[:_c2] + "。"
+        elif _tail[-1] in "：:":
+            # 以冒号收尾 = 承诺了一个没有下文的清单（如「…资金集中上游：」）。
+            # 只把冒号换成句号，不删内容 —— 这一支的内容是完整的，
+            # 缺的只是后面那个列表。
+            _dropped = _tail[-1]
+            _lines[_li] = _tail[:-1] + "。"
+        else:
+            return t      # 整行都短/无边界 → 不判，交给结构闸门
+    if not _dropped.strip():
+        return t
+    _res = "\n".join(_lines).rstrip()
+    if not _res.strip():
+        return t          # 整条都是碎片 → 不动（交给结构闸门判空壳）
+    _log(f"末尾残句已剔除（{len(_dropped)} 字：「{_dropped.strip()[:24]}」）"
+         f"—— 只删不补，不猜后续")
+    return _res
+
+
+def _split_wall_lines(t):
+    """把「一堵墙」式的超长段拆成多条短行。
+
+    ## 为什么要做到代码层
+
+    prompt 的规则⑤白纸黑字写着「当日情况必须拆成 2~4 个短段，每段一件事 /
+    把 8~9 个数据点写成一整段 200+ 字，在手机上就是一堵墙，没人会读」，
+    但**代码侧没有任何等效检查** —— 与「必带段不在代码侧检查就会静默消失」
+    是同一类缺陷，只是这次缺的是排版，不是内容。
+
+    `[实测]` 2026-11-19 14:53「收盘前汇总」：6 个段里
+        **盘面** 289 字一行
+        **关键位** 223 字一行
+        **资金** 156 字一行
+    手机屏宽约 22 字，289 字 = **13 行折行**且没有缩进 —— 整条消息
+    读起来就是三堵墙。同一天 13:36 那条（正常产出）最大行 223 字、
+    AI 自己拆了 13 段，对比之下这条的排版明显是「AI 被预算掐断后
+    的未完成品」，但代码层没拦住、照发。
+
+    ## 为什么按「、」「；」而不是按句号
+
+    段内本来就用「；」分隔多个并列事实，用「、」分隔同类项。
+    在**标点处**断开不会产生残句（这与「距 X 上方」那种真正的半截话
+    不同，后者没有标点边界可切，只能靠 prompt 约束）。
+    句号不切：一句完整的话本身就是最小单位，切了反而碎。
+
+    ## 只切超长行、只切段内
+
+    判据是**行长 > 手机 6 行**（22 字 × 6 ≈ 130 字）。短行不动 ——
+    排版正常的消息不该被重排。段头（`**盘面**`）保留在首行，续行
+    缩进两个空格，让读者看出这是同一段的延续而不是新段。
+
+    ⚠️ 幂等：切过的行每段都 ≤ 阈值，再跑一次不再命中。
+    """
+    if not t or not isinstance(t, str):
+        return t
+    # 22 字/行 × 6 行。超过就该拆 —— 与规则⑤的「2~4 个短段」同量级。
+    _LIMIT = 132
+    # 只拆这些行：**正文段**（`**段名**` 起头）。标题（`>` 引用块）、
+    # 关注板块的行（每行一个板块，本来就短）不在此列。
+    _out = []
+    _n = 0
+    for _ln in t.split("\n"):
+        _st = _ln.strip()
+        if (len(_st) <= _LIMIT or not _st.startswith("**")
+                or _st.startswith("> ") or "\u3000" in _st):
+            _out.append(_ln)
+            continue
+        # 段头 = `**xxx**` 这一整块的结尾位置；后面接 body。
+        _m = re.match(r"^(\*\*[^*]+\*\*)(.*)$", _st)
+        if not _m:
+            _out.append(_ln)
+            continue
+        _head, _body = _m.group(1), _m.group(2)
+        if len(_body) <= _LIMIT - len(_head):
+            _out.append(_ln)
+            continue
+        # 按「；」先分句（并列事实的天然边界），句子内部再按「、」分。
+        # 保留分隔符，避免把「A、B」切成「A」「B」丢信息。
+        _pieces = [p for p in re.split(r"(?<=[；;])", _body) if p.strip()]
+        _rows, _cur = [], _head
+        for _p in _pieces:
+            while len(_p) > _LIMIT - 2:
+                _cut = _p.rfind("、", 0, _LIMIT - 2)
+                if _cut <= 0:
+                    _cut = _LIMIT - 2
+                    # 找不到顿号边界就硬切：只切字，不在词中停 ——
+                    # 挑一个后面不是数字的位置，免得「20 日低」被劈开。
+                    while (_cut > 10 and _p[_cut:_cut + 1].isdigit()):
+                        _cut -= 1
+                else:
+                    _cut += 1          # 含顿号
+                if len(_cur) + len(_p[:_cut]) > _LIMIT:
+                    _rows.append(_cur)
+                    _cur = "  " + _p[:_cut]
+                else:
+                    _cur += _p[:_cut]
+                _p = _p[_cut:]
+            if len(_cur) + len(_p) > _LIMIT and _cur != _head:
+                _rows.append(_cur)
+                _cur = "  " + _p
+            else:
+                _cur += _p
+        if _cur.strip():
+            _rows.append(_cur)
+        if len(_rows) > 1:
+            _n += 1
+            _out.extend(_rows)
+        else:
+            _out.append(_ln)
+    if not _n:
+        return t
+    _res = "\n".join(_out)
+    # 只留痕，不改内容语义 —— 与「AI 输出缺热点段」同族观测。
+    _log(f"超长段已按标点拆行（{_n} 段超过 {_LIMIT} 字，"
+         f"手机端原本会折成多行且无缩进）")
+    return _res
+
+
 def _strip_placeholder_lines(txt):
     """删掉兜底模板里的**占位行**（不仿造任何值）。
 
@@ -7369,6 +7543,18 @@ def produce_text(brief, hits, plan, slot, q, now, hot=None):
     txt = _norm_levels_line(txt, q, slot, now)
     # ⚠ 2026-11-10：盘前槽位在主 AI/降级/兜底三条路径的**共同出口**做一次动作建议剔除。
     txt = _advice_lines(txt, slot)
+    # ⚠️ 超长段拆行**放在所有按行规范化之后、_spacers 之前**：
+    #   · 之前的 `_norm_sectors` / `_norm_index_line` / `_norm_levels_line`
+    #     都按**行**定位段头，先拆行会让它们找不到「**关注板块**」这种整行；
+    #   · `_spacers` 处理的是空行与引用块，拆行不新增空行，先后无影响，
+    #     但放在它之前能让它看到最终的段落结构。
+    # 与 `_strip_placeholder_lines` 同理由：共用收尾就放在**共用的位置**，
+    # 这样 AI 路径与兜底路径都会经过（兜底模板本来就分行，天然不命中）。
+    # ⚠️ 残句剔除必须**在拆行之前**：拆行按标点定位，残句会把
+    # 尾部边界算错（它没有句末标点）；先剔残、再拆行，两者都看到
+    # 干净的行结构。
+    txt = _drop_dangling_tail(txt)
+    txt = _split_wall_lines(txt)
     txt = _spacers(txt)
     # ⚠️ 可观测性（2026-10-12）：brief 里给了【市场热点】而 AI 没写「热点」
     # 段 —— 实测 13:30 那轮就是这样（正文仅 269 字，不是字数不够，是它
