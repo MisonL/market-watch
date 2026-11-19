@@ -2112,7 +2112,7 @@ def detect(q, sg, now, st):
         v2, v3 = _num(v.get("f2")), _num(v.get("f3"))
         if _hk_live:
             if v2 is not None and v2>=th: hits.append(("hstech_up", f"恒生科技{v2}≥{th}"))
-            dn = T("hstech_down", 3695)
+            dn = T("hstech_down", 3630)
             if v2 is not None and v2<=dn: hits.append(("hstech_down", f"恒生科技{v2}≤{dn}"))
             dr = T("hstech_drop", -1.5)
             if v3 is not None and v3<=dr: hits.append(("hstech_drop", f"恒生科技{v3:+.2f}%"))
@@ -2835,7 +2835,7 @@ def build_brief(q, sg, hits, now, hot=None, slot=None):
         # 等于把被禁的词根喂给 AI，与规则自相矛盾。
         L.append(f"  [观察触发线] 恒生科技 上方 {th_h}"
                  f"（距离 {(th_h/v['f2']-1)*100:+.2f}%），"
-                 f"下方 {threshold('hstech_down',3695)}")
+                 f"下方 {threshold('hstech_down',3630)}")
 
     # deadline 时段专用：告诉 AI「今天之后还有几个可操作的交易日」。
     # deadline slot 的 rule 要求它按实际紧迫程度措辞，但原先 brief 里
@@ -6588,6 +6588,37 @@ def _split_wall_lines(t):
     _log(f"超长段已按标点拆行（{_n} 段超过 {_LIMIT} 字，"
          f"手机端原本会折成多行且无缩进）")
     return _res
+
+
+def sector_rows(text):
+    """从推送正文里挑出**板块行**（每行一个板块的紧凑列表）。
+
+    ## 为什么抽成单一实现
+
+    这条判据有两处消费者：`selfcheck` 的「兜底模板每行板块都要带盘前标注」
+    核对，以及 `tests/test_push_layout.py`。原先两处各写一份，2026-11-19
+    就吃过一次亏：
+
+    `produce_text` 末尾新增了 `_split_wall_lines` —— 超过 132 字的正文段
+    按「；」「、」拆成多行，**续行缩进两格**。那些续行（隔夜外盘、美债、
+    关键位）同样含「%」、同样不以 `**` `>` `【` 开头，于是 selfcheck 的
+    原判据把它们当成"缺盘前标注的板块行"，报「4 行缺少盘前标注」、
+    整体 rc=1 并推了告警。
+
+    判据里那个**顶格**要求（`x == x.lstrip()`）就是修复：续行缩进，
+    不是独立板块行。写成共用函数后，改判据只有一处可改，测试也不必
+    抄一遍 —— 抄出来的副本测的是副本，不是生产代码。
+
+    ⚠️ 判据是「顶格 + 含 `%` + 不以 `**` `>` `【` 开头」，三条缺一不可：
+      · 去掉「顶格」→ 缩进续行被误报（2026-11-19 事故）
+      · 去掉「含 %」→ `**盘面**` 这类段头也被算进来
+      · 去掉「不以 ** 开头」→ 段头行本身被当成板块行
+    """
+    if not text or not isinstance(text, str):
+        return []
+    return [x for x in text.split("\n")
+            if "%" in x and x == x.lstrip()
+            and not x.startswith(("**", ">", "【"))]
 
 
 def _strip_placeholder_lines(txt):

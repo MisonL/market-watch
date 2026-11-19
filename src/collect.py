@@ -334,19 +334,22 @@ def evaluate(q, sg, now):
         if v["f2"] >= hstech_up_threshold(now.date()):
             ev.append({"k":"hstech_up","msg":f"恒生科技 {v['f2']} ≥ {hstech_up_threshold(now.date())}",
                        "chg":_v3,"prio":"high"})
-        # 默认值写**字面量**，与 analyze.detect() 的 T("hstech_down", 3737) 逐字一致。
+        # 默认值写**字面量**，与 analyze.detect() 的 T("hstech_down", 3630) 逐字一致
+        # （2026-11-19 同步：自检 [阈值兜底一致性] 会逐字比对调用点的字面默认值
+        #  与 sectors.json 的真值，注释里写的数也要跟着改，否则读代码的
+        #  人会以为现行兜底还是旧值）。
         # 注：threshold() 的实现是 `TH.get(key, default)` —— 只要 TH 里有该键，
         # 传入的 default 就完全不参与，所以 threshold(k, TH[k]) 与
         # threshold(k, 字面值) 在正常情况下**等价**，不是分叉来源。
         # 改用字面量是为了另一种情况：若某天该键从 TH 里被删掉，
         # 写 TH[k] 会在**求值实参时**直接 KeyError（在 threshold 内部兜底之前就炸），
         # 而字面量会安静地退回一个明确的值。
-        if v["f2"] <= threshold("hstech_down", 3695):
+        if v["f2"] <= threshold("hstech_down", 3630):
             # ⚠️ 键名必须是 hstech_down（与 analyze.detect / webui 一致）。
             # 原先写 hstech_dn —— 同一事件两个名字，pending.json 里叫 dn、
             # fired 里叫 down，面板按 down 查永远查不到。
             # （阈值键 hstech_down 本来就对，只有事件键写错了。）
-            ev.append({"k":"hstech_down","msg":f"恒生科技 {v['f2']} ≤ {threshold('hstech_down', 3695)}",
+            ev.append({"k":"hstech_down","msg":f"恒生科技 {v['f2']} ≤ {threshold('hstech_down', 3630)}",
                        "chg":_v3,"prio":"high"})
     if not guard:
         # IDX3S() 返回 {完整 secid: (名称, 阈值)}（来自 M.idx_thresholds()），

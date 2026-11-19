@@ -127,6 +127,87 @@ try:
     # 幂等
     check(A._drop_dangling_tail(_r2) == _r2, "残句剔除必须幂等")
 
+    # ---------- ④b 续行缩进不得被下游当成"板块行" ----------
+    # ⚠️⚠️ 2026-11-19 生产事故（自检 rc=1 + 推告警）：`_split_wall_lines`
+    # 把隔夜外盘 / 美债 / 关键位等超长段拆成多行后，**续行缩进两格**、
+    # 同样含「%」、同样不以 `**` `>` `【` 开头 —— 于是 selfcheck 里
+    # 「兜底模板每行板块都要带盘前标注」那条判据把它们全当成缺标注的
+    # 板块行，报「4 行缺少盘前标注」、整体 rc=1。
+    #
+    # 这不是 selfcheck 写错了，是**我的拆行引入的新行形态**没被下游识别。
+    # 本项锁住两件事：
+    #   ① 续行必须缩进（下游靠这个区分）
+    #   ② selfcheck 的板块行判据必须要求顶格
+    _wall2 = ("**隔夜全球** " + "、".join(
+        f"指数{i} -{i}.00%" for i in range(1, 40)) + "。")
+    _r3 = A._split_wall_lines(_wall2)
+    _r3rows = [x for x in _r3.split("\n") if x.strip()]
+    check(len(_r3rows) > 1, "超长隔夜段应被拆行")
+    check(all(x.startswith("  ") for x in _r3rows[1:]),
+          "续行必须缩进两格 —— 下游靠缩进区分续行与独立板块行")
+    # 行为级复刻 selfcheck 的那段场景：兜底模板 + 09:18 → 每个**顶格**
+    # 板块行都必须带「盘前参考价」，且续行不得被算作板块行。
+    #
+    # ⚠️⚠️ 我第一版这里写的是 `check('x == x.lstrip()' in 源码)` —— 而
+    # selfcheck.py 的**注释里**恰好也写了 `x == x.lstrip()`，于是把代码判据
+    # 删掉、注入缺陷，断言**照样绿**。这是本次任务里同一个错误犯的第三次：
+    # 判据指向的对象看不见要测的缺陷（前两次分别是「查 `[-1]`」和
+    # 「子串 `、CP` 撞上 `、CPO`」）。所以这里改成**跑真逻辑**。
+    import datetime as _dt
+    import shutil as _sh
+    # ⚠️ 本项要真的产出板块行，就必须有 `conf/sectors.json`。而
+    # `tests/run_all.sh` 给每个测试设了**独立临时 MW_DIR**（隔离状态），
+    # 那个目录里没有 conf —— `_cfg_items("push")` 返回空，板块行一行都
+    # 产不出来，本项就退化成"空转失败"（`[实测]` 单跑通过、全量跑失败，
+    # 差的就是这个）。
+    # 做法：把 conf 拷进当前 MW_DIR（只读复制，不改内容），让兜底模板
+    # 与线上走同一份配置。
+    _conf_src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "conf")
+    _conf_dst = os.path.join(str(getattr(A, "DIR", "") or
+                                 os.environ.get("MW_DIR", "")), "conf")
+    if _conf_dst and not os.path.isdir(_conf_dst) and os.path.isdir(_conf_src):
+        _sh.copytree(_conf_src, _conf_dst)
+    _orig_ai = A.ai_analyze
+    try:
+        A.ai_analyze = lambda *a, **k: ""          # 强制走兜底模板
+        _now = _dt.datetime.combine(_dt.date.today(), _dt.time(9, 18))
+        _q = {"1.000001": {"f2": 3840.0, "f3": 0.27},
+              "124.HSTECH": {"f2": 4243.0, "f3": -0.15}}
+        for _s, _i in A._cfg_items("push"):
+            _c = _i.get("code")
+            if _c:
+                _q[_c] = {"f2": 1000.0, "f3": -2.5,
+                          "f62": -5e9, "f184": -6.0}
+        _b = A.build_brief(_q, None, [], _now, hot=None, slot="09:25")
+        # ⚠️ 变量名**不能叫 `_ok`** —— 它是模块级的断言计数器，
+        # 被这里覆盖后 `check()` 里的 `_ok += 1` 变成 `True += 1`，
+        # 计数与"是否失败"全部失真（`[实测]` 覆盖后只报 7 个断言，
+        # 实际执行了 20 多个）。
+        _t, _ok_ai, _h_ai = A.produce_text(_b, [], "", "09:25", _q, _now)
+        # ⚠️⚠️ **判据只有一份实现**：`analyze.sector_rows()`。
+        # selfcheck 与本测试都调它 —— 这样"改了 selfcheck 的判据"能被这里
+        # 测到。原先把判据在测试里**复刻**一遍，结果把 src/selfcheck.py 退回
+        # 未修复版，测试照样全绿（`[实测]` 已复现）—— 那是同义反复，
+        # 测的是我抄的那份副本，不是生产代码。
+        _rows = A.sector_rows(_t)
+        _bad = [x for x in _rows if "盘前参考价" not in x]
+        check(bool(_rows), "兜底模板必须产出顶格板块行（否则本项空转）")
+        check(not _bad,
+              f"顶格板块行必须都带盘前参考价，实得 {len(_bad)} 行缺："
+              f"{_bad[:2]}")
+        # 反向校验：本场景必须**真的**产生了缩进续行，否则"续行不参与核对"
+        # 这条修复无从验证（空转保护）。
+        _all_rows = [x for x in _t.split("\n")
+                     if "%" in x and not x.startswith(("**", ">", "【"))]
+        check(len(_all_rows) > len(_rows),
+              "本场景必须真的产生了缩进续行（否则本项测不到那个缺陷）")
+        # 且续行里确实有"缺标注"的行 —— 证明放宽判据就会误报。
+        check(any("盘前参考价" not in x for x in _all_rows),
+              "续行中必须存在不带盘前参考价的行 —— 否则本项测不到误报")
+    finally:
+        A.ai_analyze = _orig_ai
+
     # ---------- ⑤ 纯函数契约 ----------
     for _f in (A._split_wall_lines, A._drop_dangling_tail):
         check(_f(None) is None and _f("") == "" and _f(123) == 123,
