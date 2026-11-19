@@ -23,6 +23,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # ⚠️⚠️ 2026-11-19（CI 健壮性）：必须显式设 job 上限。
+    #
+    # GitHub 的默认上限是 **6 小时**。原先真出现"某个测试挂死"时（等锁、
+    # 等网络、死循环），CI 会安静地跑满 6 小时才失败 —— 期间每次 push 都
+    # 在排队、日志滚没了、而且没有任何一层说清"卡在哪个测试"。
+    #
+    # 本 job 正常耗时 **16~25s**（实测 13 次运行），即使 runner 极慢也就
+    # 一两分钟。10 分钟是 20 倍余量：目标是抓"挂死"，不是抓"慢"。
+    #
+    # 与 `tests/run_all.sh` 里的单测试超时（300s）是两层：单测试超时负责
+    # 定位到**具体哪个文件**，这里负责兜"整个 job 卡在别处"（编译、
+    # checkout、锚点检查）。两层都必要 —— 只有一层时，坏在另一层就抓不到。
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -88,8 +101,14 @@ jobs:
             line=$(grep -E '^通过 [0-9]+ / 跳过 [0-9]+ / 失败 [0-9]+' /tmp/run_all.out | tail -1)
             n_ok=$(echo "$line" | sed -E 's|通过 ([0-9]+).*|\1|')
             n_skip=$(echo "$line" | sed -E 's|.*跳过 ([0-9]+).*|\1|')
+            n_fail=$(echo "$line" | sed -E 's|.*失败 ([0-9]+).*|\1|')
+            # ⚠️ 2026-11-19：原先这里写 `$(( n_ok + n_skip + n_fail ))`，
+            # 而 `n_fail` **从未被赋值** —— 变量展开成空串，算术里当 0。
+            # 后果：总数偏小。这个缺陷单独看无害（总数只用在下面的
+            # "跳过数不得超过一半"判断），但它是个**假变量**：读者会以为
+            # 总数算进去了失败数，实际没有。补上解析。
             n_total=$(( ${n_ok:-0} + ${n_skip:-0} + ${n_fail:-0} ))
-            echo "通过 ${n_ok:-?} / 跳过 ${n_skip:-?} / 共 $n_total"
+            echo "通过 ${n_ok:-?} / 跳过 ${n_skip:-?} / 失败 ${n_fail:-?} / 共 $n_total"
             if [ "${n_ok:-0}" -eq 0 ]; then
               echo "::error::一个测试都没真正执行（全部跳过）—— 这不是通过"
               exit 1
@@ -108,7 +127,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-output-py${{ matrix.python-version }}
+          # ⚠️ 2026-11-19：这份留档**建了却从未生效过**。
+          # `run_all.sh` 原先从不生成 `tests/*.log`（测试输出只存在它自己的
+          # mktemp 目录里，`trap ... EXIT` 会整个删掉），于是 2026-11-18 那次
+          # CI 红灯在 GitHub 上是 `artifacts: 0` —— 想查只能翻几百行混在
+          # 一起的控制台输出。
+          # 现在 `run_all.sh` 只把**失败/超时**那些测试的完整输出写进
+          # `tests/<name>.log`（600 权限），这一个步骤才真正有东西可传。
           path: |
             tests/*.log
-          if-no-files-found: ignore
+          if-no-files-found: warn       # 失败却没产物 = 留档机制自己坏了，要说出来
           retention-days: 7

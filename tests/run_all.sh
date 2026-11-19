@@ -86,6 +86,30 @@ print(resolve_workers("MW_TEST_JOBS", min_workers=2, max_workers=12))
 case "$_JOBS" in ''|*[!0-9]*) _JOBS=4 ;; esac
 [ "$_JOBS" -lt 1 ] && _JOBS=1
 
+# ---------- 单个测试的超时保护 ----------
+#
+# ⚠️⚠️ 2026-11-19（CI 健壮性）：原先**没有任何超时**。一个测试卡住
+# （等锁、等网络、死循环）会让 `run_all.sh` 永久挂起，而 GitHub Actions
+# 的默认 job 上限是 **6 小时** —— 那时才发现，日志早滚没了，
+# 而且没有任何一层会说清"卡在哪个测试"。
+#
+# 300s 的取值依据：本机最慢的是 `test_state_backup_recovery.py`（实测约
+# 13s，真做 fsync），其次 `test_review_20261111.py` 的并发用例（约 8s，
+# 真起 4 个 collect 子进程）。给 300s 是 20 倍余量 —— 目标是抓"挂死"，
+# 不是抓"慢"。
+#
+# `timeout` 不是 POSIX 标准命令：Linux（coreutils）有，macOS 默认没有
+# （本机装了 coreutils 才有 `/usr/local/bin/timeout`）。所以探测两个名字，
+# 都没有时**退化为无超时**而不是报错 —— 不能因为本地缺命令就让整个测试
+# 跑不起来。
+_TIMEOUT_BIN=""
+for _c in timeout gtimeout; do
+    if command -v "$_c" >/dev/null 2>&1; then
+        _TIMEOUT_BIN=$(command -v "$_c"); break
+    fi
+done
+_TEST_TIMEOUT=${MW_TEST_TIMEOUT:-300}
+
 # 每个测试的临时产物集中在一个总目录，便于统一清理与归属
 _TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/mw_runall_XXXXXX") || exit 1
 trap 'rm -rf "$_TMPDIR"' EXIT
@@ -106,7 +130,16 @@ _run_one() {
     fi
     _d=$(mktemp -d "$_TMPDIR/sandbox_XXXXXX") || exit 1
     (
-        MW_DIR="$_d" PYTHONDONTWRITEBYTECODE=1 "$_py" -B "$_t" > "$_TMPDIR/$_base.out" 2>&1
+        # ⚠️ 超时的退出码会是 124（coreutils 约定）。不能把它与"断言失败"
+        # 混为一谈 —— 见下方汇总处对 124 的专门说明。
+        if [ -n "$_TIMEOUT_BIN" ]; then
+            MW_DIR="$_d" PYTHONDONTWRITEBYTECODE=1 \
+                "$_TIMEOUT_BIN" "$_TEST_TIMEOUT" "$_py" -B "$_t" \
+                > "$_TMPDIR/$_base.out" 2>&1
+        else
+            MW_DIR="$_d" PYTHONDONTWRITEBYTECODE=1 \
+                "$_py" -B "$_t" > "$_TMPDIR/$_base.out" 2>&1
+        fi
         printf '%s' "$?" > "$_TMPDIR/$_base.rc"
     ) &
 }
@@ -193,7 +226,15 @@ for _t in tests/*.py; do
         printf "  ⏭️  %-46s 跳过（解释器缺失）\n" "$_base"
         _n_skip=$((_n_skip + 1)); continue
     fi
-    if [ "$_rc" -ne 0 ]; then
+    if [ "$_rc" = "124" ]; then
+        # ⚠️ 124 = 被 timeout 杀掉的约定码。必须**单独报**：
+        # 它和"断言失败"的排查方向完全不同（前者查挂死/死锁/等网络，
+        # 后者读断言消息就够了）。混成一条会让人去读一个根本不存在
+        # 的 AssertionError。
+        printf "  ⏱️  %-46s 超时（>%ss 被杀）—— 查挂死/等锁/等网络\n" \
+            "$_base" "$_TEST_TIMEOUT"
+        _n_fail=$((_n_fail + 1)); _failed="$_failed $_base(TIMEOUT)"
+    elif [ "$_rc" -ne 0 ]; then
         printf "  ❌ %-46s rc=%s %s\n" "$_base" "$_rc" \
             "$(printf '%s\n' "$_out" | grep -E 'AssertionError|Error' | tail -1 | cut -c1-52)"
         _n_fail=$((_n_fail + 1)); _failed="$_failed $_base"
@@ -212,6 +253,47 @@ done
 
 echo
 echo "通过 $_n_ok / 跳过 $_n_skip / 失败 $_n_fail"
+
+# ---------- 失败时把现场留在 tests/ 下 ----------
+#
+# ⚠️⚠️ 2026-11-19（CI 实测）：CI 有一个「失败时留档」步骤上传 `tests/*.log`，
+# 但 `run_all.sh` **从来不生成任何 `tests/*.log`** —— 每个测试的输出只存在
+# `$_TMPDIR` 里，而 `trap ... EXIT` 会把它整个删掉。
+#
+# 结果：2026-11-18 那次 CI 红灯（`test_ratelimit_crossprocess`）在 GitHub 上
+# **零产物**（`artifacts: 0`），想查只能靠 `gh run view --log` 翻那几百行
+# 混在一起的控制台输出。留档机制建了、却从来没生效过 —— 与"判定在、射程空"
+# 同族。
+#
+# 现在：只把**失败/超时**那些测试的完整输出各写一份 `tests/<name>.log`。
+# 不写全部 —— 通过的那些没有诊断价值，全写会让产物膨胀几十倍。
+if [ -n "$_failed" ]; then
+    for _t in tests/*.py; do
+        _base=$(basename "$_t")
+        case "$_failed" in
+            *"$_base"*) ;;          # 在失败清单里
+            *) continue ;;
+        esac
+        _rc=$(cat "$_TMPDIR/$_base.rc" 2>/dev/null || echo 99)
+        # ⚠️ 必须 600：自检有一条判据「状态/日志/锁文件不得带 group/other 位」，
+        # 而 `_sens22()` 对**非 .py 文件**一律视为敏感（`tests/x.py.log` 的
+        # basename 是 `x.py.log`，endswith(".py") 为 False）。
+        # 裸重定向按 umask 022 会建出 **644** —— `[实测]` 直接让那条判据变红。
+        # 用 umask 077 在子 shell 里收紧，比事后 chmod 少一次失败窗口。
+        (
+            umask 077
+            {
+                echo "# $_base —— rc=$_rc"
+                echo "# 时间: $(date '+%Y-%m-%d %H:%M:%S')"
+                echo "# 解释器: $_SYS_PY"
+                echo "# ------------------------------"
+                cat "$_TMPDIR/$_base.out" 2>/dev/null
+            } > "tests/$_base.log" 2>/dev/null
+        )
+    done
+    echo "失败现场已写入 tests/*.log（CI 会作为产物上传）"
+fi
+
 if [ -n "$_failed" ]; then
     echo "失败清单：$_failed"
     exit 1
