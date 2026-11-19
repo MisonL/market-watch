@@ -1715,17 +1715,24 @@ def _host_dead(host, half_open=True):
 _MARK_ROUND = set()
 
 def _round_begin():
-    """开始新一轮取数：重置所有"本轮内一次性"的状态。
+    """开始新一轮取数：重置「本轮已计过失败的主机」。
 
-    ⚠️ 只该由**顶层取数入口**调用（`quotes()` / `hk_quotes()`）。
-    嵌套调用重复清空是安全的（幂等），但会让外层的"已计过"记录丢失 ——
-    所以入口处判一次就够了，不要在中层函数里调。
+    ⚠️ 只该由**顶层取数入口**调用（`quotes()`）。
+    ⚠️⚠️ **不要在这里清 `_HALF_OPEN_TRIED`** —— 那会打破半开探测的
+    「每轮每主机最多探一次」保证。
+
+    `[自查]` 我第一版写了 `_HALF_OPEN_TRIED.clear()`，随后实测：
+        同进程调 2 次 quotes() → _round_begin 被调 2 次
+        → 探测令牌被重置 2 次 → 死主机一轮内可被探 2 次
+    而 `_HALF_OPEN_TRIED` 的**原始语义就是进程级**（见 `_host_dead` 的
+    注释：「下一轮进程重启时集合清空，自然再探一次」）。launchd 每轮起
+    新进程，所以"进程级"恰好等于"轮级"，不需要也不该在这里重清。
+
+    对比：`_MARK_ROUND` 必须每轮清，否则长驻进程（webui）里计数永远
+    不涨、退避永不生效；而清一次的代价只是"同进程多调几次 quotes()
+    可能多计一两次"，比原来的 9 次低一个数量级。
     """
     _MARK_ROUND.clear()
-    try:
-        _HALF_OPEN_TRIED.clear()
-    except Exception:
-        pass
 
 def _mark_dead(host):
     # ⚠️⚠️ **手工验证这道状态机时，先把状态重定向到 /tmp。**
