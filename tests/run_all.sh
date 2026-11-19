@@ -118,7 +118,11 @@ trap 'rm -rf "$_TMPDIR"' EXIT
 _run_one() {
     _t=$1; _base=$(basename "$_t")
     case "$_base" in
-        test_agent_summary_*) _py=$_VENV_PY ;;
+        # ⚠️ 2026-11-19：`test_agent_memory_seed.py` 同样 import
+        # `claude_agent_sdk`（它要加载 agent 模块本体才能验证自举），
+        # 所以也要走 agent 的 venv。漏配这一条时它会用系统解释器跑、
+        # 打印 SKIP 退出 0 —— 汇总里显示"跳过 1"，**本项从未真正验证**。
+        test_agent_summary_*|test_agent_memory_seed.py) _py=$_VENV_PY ;;
         *)                    _py=$_SYS_PY ;;
     esac
     if [ ! -x "$_py" ]; then
