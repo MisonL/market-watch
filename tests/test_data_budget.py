@@ -436,4 +436,145 @@ check(_hit7,
       f"日志代码在 ≠ 日志会打")
 check(any("行情" in x for x in _hit7), f"耗时日志里没有行情段：{_hit7[:2]}")
 
-print(f"ALL PASS (取数全局上限 + 编排层闸门 + 慢取数留痕 {_ok} 个断言)")
+
+# ---------- ⑧ 取数入口必须在预算耗尽时零发包（2026-11-21，P1）----------
+#
+# `data_cap` 只管 clist/members/量比三路，`quotes`（行情/港股/备用源）
+# **完全不受约束**。`[实测]` 11:42 那轮 300s 里 143s 花在 quotes/trend，
+# AI 因此拿到 0s 预算、整轮推模板。
+#
+# ⚠️ 这里有个必须锁死的**副作用**要求：零发包必须同时"不判主机死亡"。
+# 若只让 `cj()` 在预算耗尽时返回 None，`_try_hosts` 会把主机
+# `_mark_dead` —— 零发包却盖 30 分钟死亡戳（本仓库记录过两次假故障）。
+# 所以闸门放在**调用方**（发起之前跳过），而不是让 `cj` 返回空。
+import marketlib as _M8
+
+# ⚠️⚠️ 原始引用必须**在这里（模块导入时）**存一次，不能放进 `_stub8()` 里。
+# 第一版就是放进去的：`_stub8()` 被调用 3 次，每次都把**已被替换成 stub 的**
+# 当前值当"原始值"存进 `_save8`，于是 `_unstub8()` 恢复出来还是 stub ——
+# 后续用例看到 cj 是假的、发包数恒为 0，报"闸门把正常重试也拦了"的假 ❌。
+# 这类"stub 套 stub"的测试污染极难从现象反推，只能靠纪律：快照与替换分离。
+_save8 = {"cj": _M8.cj, "hk": _M8._hk_quotes_via_tencent,
+          "log": _M8.log, "dlo": _M8._daily_log_once}
+import feeds as _fd8
+_save8["backup"] = _fd8.backup_quotes
+
+
+def _stub8():
+    """把外发全部换成计数器，避免任何真实网络（**只替换，不存快照**）。"""
+    _c = {"cj": 0, "hk": 0, "backup": 0}
+    _M8.cj = lambda *a, **k: (_c.__setitem__("cj", _c["cj"] + 1), None)[1]
+    _M8._hk_quotes_via_tencent = lambda s: (
+        _c.__setitem__("hk", _c["hk"] + 1), {})[1]
+    _M8.log = lambda m, lv=None: None
+    _M8._daily_log_once = lambda *a, **k: None
+    _fd8.backup_quotes = lambda codes: (
+        _c.__setitem__("backup", _c["backup"] + 1), {})[1]
+    return _c
+
+
+def _unstub8():
+    _M8.cj = _save8["cj"]
+    _M8._hk_quotes_via_tencent = _save8["hk"]
+    _M8.log = _save8["log"]
+    _M8._daily_log_once = _save8["dlo"]
+    _fd8.backup_quotes = _save8["backup"]
+    _M8.set_data_deadline(None)
+
+
+# ① data_expired 三态
+_M8.set_data_deadline(None)
+check(_M8.data_expired() is False, "未设截止时 data_expired 必须为 False")
+_M8.set_data_deadline(time.time() + 60)
+check(_M8.data_expired() is False, "剩 60s 时 data_expired 必须为 False")
+_M8.set_data_deadline(time.time() - 1)
+check(_M8.data_expired() is True, "已过期时 data_expired 必须为 True")
+_M8.set_data_deadline(time.time())
+check(_M8.data_expired() is True, "恰好 0 时 data_expired 必须为 True（<=0 判据）")
+
+# ② 预算耗尽 → quotes 零发包，且不增加死主机
+try:
+    _c8 = _stub8()
+    _dead_before = len(getattr(_M8, "_HOST_DEAD", {}) or {})
+    _M8.set_data_deadline(time.time() - 1)
+    _out8 = _M8.quotes(["1.000001", "100.HSI", "124.HSTECH"])
+    _total8 = sum(_c8.values())
+    check(_total8 == 0,
+          f"预算耗尽时 quotes 仍发了 {_total8} 个包"
+          f"（cj={_c8['cj']} 港股={_c8['hk']} 备用={_c8['backup']}）")
+    _dead_after = len(getattr(_M8, "_HOST_DEAD", {}) or {})
+    check(_dead_after == _dead_before,
+          f"预算耗尽时死主机数 {_dead_before}→{_dead_after} —— "
+          f"零发包不得判主机死亡（假故障）")
+    check(isinstance(_out8, dict), "预算耗尽时 quotes 必须仍返回 dict（空或部分）")
+
+    # ③ 未设截止 → 必须照常取数（collect/webui 等场景不能被误伤）
+    _c8 = _stub8()
+    _M8.set_data_deadline(None)
+    _M8.quotes(["1.000001", "100.HSI"])
+    check(sum(_c8.values()) > 0, "未设截止时 quotes 竟不发包 —— 误伤了无截止场景")
+
+    # ④ 预算充足 → 必须照常取数
+    _c8 = _stub8()
+    _M8.set_data_deadline(time.time() + 60)
+    _M8.quotes(["1.000001", "100.HSI"])
+    check(sum(_c8.values()) > 0, "预算充足时 quotes 竟不发包 —— 闸门过紧")
+finally:
+    _unstub8()
+
+# ⑤ cj 的重试/兜底链必须被预算拦住（但不能拦首次尝试）
+_save8b = {"run": _M8.subprocess.run, "fb": _M8._fallback_get,
+           "dead": _M8._host_dead, "pdead": _M8.PERMANENTLY_DEAD,
+           "wait": _M8.RL.wait, "fail": _M8.RL.fail, "ok": _M8.RL.ok,
+           "log": _M8.log, "dlo": _M8._daily_log_once}
+
+
+class _R8:
+    stdout = ""
+
+
+def _net8():
+    _n = [0]
+
+    def _fake_run(*a, **k):
+        _n[0] += 1
+        raise ValueError("empty")      # 空响应：会走到重试/兜底
+    _M8.subprocess.run = _fake_run
+    _M8._fallback_get = lambda *a, **k: (_n.__setitem__(0, _n[0] + 1), None)[1]
+    _M8.PERMANENTLY_DEAD = set()
+    _M8._host_dead = lambda h: False
+    _M8.RL.wait = lambda h: True
+    _M8.RL.fail = lambda h: None
+    _M8.RL.ok = lambda: None
+    _M8.log = lambda m, lv=None: None
+    _M8._daily_log_once = lambda *a, **k: None
+    return _n
+
+
+try:
+    _M8.set_data_deadline(time.time() + 120)
+    _n8 = _net8()
+    _M8.cj("https://example.test/api", retries=3, timeout=1)
+    check(_n8[0] == 4,
+          f"预算充足时 cj 应发 3 次重试 + 1 次兜底 = 4 个包，实得 {_n8[0]} —— "
+          f"闸门把正常重试也拦了")
+
+    _M8.set_data_deadline(time.time() - 1)
+    _n8 = _net8()
+    _M8.cj("https://example.test/api", retries=3, timeout=1)
+    check(_n8[0] == 1,
+          f"预算耗尽时 cj 应只放行首次尝试 = 1 个包，实得 {_n8[0]} —— "
+          f"重试/兜底链（最坏再拖 175s）没被拦住")
+finally:
+    _M8.subprocess.run = _save8b["run"]
+    _M8._fallback_get = _save8b["fb"]
+    _M8._host_dead = _save8b["dead"]
+    _M8.PERMANENTLY_DEAD = _save8b["pdead"]
+    _M8.RL.wait = _save8b["wait"]
+    _M8.RL.fail = _save8b["fail"]
+    _M8.RL.ok = _save8b["ok"]
+    _M8.log = _save8b["log"]
+    _M8._daily_log_once = _save8b["dlo"]
+    _M8.set_data_deadline(None)
+
+print(f"ALL PASS (取数上限 + 编排闸 + 慢取数留痕 + 入口零发包 {_ok} 个断言)")

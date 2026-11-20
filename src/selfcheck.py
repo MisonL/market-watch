@@ -1073,7 +1073,26 @@ def _snap_stubs():
                                     "_AI_FAIL_FILE",
                                     # 同段 ⑤ 的行为断言桩了这两个，用于数
                                     # 「到底有没有真去调 AI」。
-                                    "claude_bin")),
+                                    "claude_bin",
+                                    # ⚠️ 2026-11-21：[取数全局上限] ⑧ 号
+                                    # 「预算耗尽零发包」断言桩了这三处外发
+                                    # （cj / 腾讯港股 / 每日去重日志），
+                                    # 用来数"到底发了几个包"。
+                                    # 又一次「新增检查项 → 新增桩 → 忘进名单」，
+                                    # 同样由 [桩泄漏] 的 AST 覆盖面扫描抓出。
+                                    "cj", "_hk_quotes_via_tencent",
+                                    "_daily_log_once",
+                                    # ⑨ 号「cj 重试链受预算约束」要把兜底链
+                                    # 换成计数器（否则会真去调代理/firecrawl），
+                                    # 并把"主机是否判死"的整体状态清空，
+                                    # 免得沙箱里残留的死亡戳让 cj 短路、
+                                    # 数出 0 次尝试（我第一次就撞上了这个）。
+                                    "_fallback_get", "_host_dead",
+                                    "PERMANENTLY_DEAD",
+                                    # 同段还桩了 data_expired 的取值来源
+                                    # （通过 set_data_deadline，已含在下面
+                                    # 的还原里，不单列为桩）。
+                                    )),
                 # `M.RL.wait = …` / `M.RL.RATE_FILE = …` 二级赋值的目标。
                 # 单独一组：对象是 RL 实例而非模块（2026-10-08 元审查，
                 # 这 5 个符号原先对账完全不可见）。
@@ -1083,7 +1102,10 @@ def _snap_stubs():
                 # 扫描要求二级赋值目标都在名单中）。
                 (_ml.RL, "marketlib.RL", ("wait", "RATE_FILE",
                                           "_HOST_FAIL_FILE", "_synced",
-                                          "count"))):
+                                          "count",
+                                          # ⑨ 号数"尝试了几次"要用 fail/ok，
+                                          # 桩了必须登记（同一条规矩）。
+                                          "fail", "ok"))):
             for _n in _names:
                 _SNAP0[(_mn, _mod, _n)] = _snap_id(getattr(_mod, _n, None))
     except Exception as _e_ss:
@@ -11979,6 +12001,109 @@ def _main(ok_all):
                 _bad5 += 1
                 print("  ❌ set_data_deadline 必须以 `_t0 + DATA_BUDGET` 调用 —— "
                       "否则截止点与轮次起点脱钩，上限形同虚设")
+        # ⑧ 取数入口必须在预算耗尽时**零发包**（2026-11-21）。
+        # `data_cap` 只管 clist/members/量比，quotes（行情/港股/备用源）
+        # 原先完全不受约束 —— 11:42 那轮 143s 就花在这里，AI 拿到 0s。
+        # 判据必须验"真的不发包"，而不是"有 if data_expired()"这句话；
+        # 且必须同时验**不误伤**：无截止/预算充足时照常取数。
+        try:
+            import feeds as _fd5b
+            _c8 = {"cj": 0, "hk": 0, "bk": 0}
+            _sv8 = (_M5.cj, _M5._hk_quotes_via_tencent, _M5.log,
+                    _M5._daily_log_once, _fd5b.backup_quotes)
+            _M5.cj = lambda *a, **k: (_c8.__setitem__("cj", _c8["cj"] + 1), None)[1]
+            _M5._hk_quotes_via_tencent = lambda s: (
+                _c8.__setitem__("hk", _c8["hk"] + 1), {})[1]
+            _fd5b.backup_quotes = lambda c: (
+                _c8.__setitem__("bk", _c8["bk"] + 1), {})[1]
+            _M5.log = lambda m, lv=None: None
+            _M5._daily_log_once = lambda *a, **k: None
+            try:
+                _dead0 = len(getattr(_M5, "_HOST_DEAD", {}) or {})
+                _M5.set_data_deadline(time.time() - 1)
+                _M5.quotes(["1.000001", "100.HSI", "124.HSTECH"])
+                _tot8 = sum(_c8.values())
+                if _tot8:
+                    _bad5 += 1
+                    print(f"  ❌ 预算耗尽时 quotes 仍发 {_tot8} 个包"
+                          f"（cj={_c8['cj']} 港股={_c8['hk']} 备用={_c8['bk']}）"
+                          f"—— 入口闸没生效，取数可越过上限继续拖整轮")
+                _dead1 = len(getattr(_M5, "_HOST_DEAD", {}) or {})
+                if _dead1 != _dead0:
+                    _bad5 += 1
+                    print(f"  ❌ 预算耗尽时死主机数 {_dead0}→{_dead1} —— "
+                          f"零发包被判成主机故障（假故障，本仓库记录过两次）")
+                # 反向：未设截止必须照常取数（不误伤 collect/webui）
+                _c8 = {"cj": 0, "hk": 0, "bk": 0}
+                _M5.set_data_deadline(None)
+                _M5.quotes(["1.000001", "100.HSI"])
+                if sum(_c8.values()) == 0:
+                    _bad5 += 1
+                    print("  ❌ 未设截止时 quotes 竟不发包 —— 误伤了无截止场景"
+                          "（collect/webui 会变成零数据）")
+            finally:
+                _M5.set_data_deadline(None)
+        except Exception as _e8:
+            _bad5 += 1
+            print(f"  ❌ 入口闸判据异常: {_e8}")
+        finally:
+            try:
+                (_M5.cj, _M5._hk_quotes_via_tencent, _M5.log,
+                 _M5._daily_log_once, _fd5b.backup_quotes) = _sv8
+            except Exception:
+                pass
+        # ⑨ `cj()` 的重试链也必须受预算约束（⑧ 只管"发起之前"，
+        # 但一次 cj 自己最坏能链到 175s：3 次重试 60s + 代理 25s +
+        # firecrawl 90s）。11:42 那轮走到 300s，后半段就是这条链。
+        # 判据两头夹：预算充足必须照常重试、预算耗尽只放行首次。
+        # 数发包次数用 `RL.wait`（每轮尝试前必调一次，已在名单里），
+        # 兜底链换成计数器 —— 全程只打 127.0.0.1 的关闭端口，零外部流量。
+        try:
+            import marketlib as _M5c
+            _sv9 = (_M5c.RL.wait, _M5c._fallback_get, _M5c.log,
+                    _M5c._daily_log_once, _M5c._host_dead,
+                    _M5c.PERMANENTLY_DEAD, _M5c.RL.fail, _M5c.RL.ok)
+            try:
+                _cnt9 = {"try": 0, "fb": 0}
+                _M5c.RL.wait = lambda h=None: (
+                    _cnt9.__setitem__("try", _cnt9["try"] + 1), True)[1]
+                _M5c.RL.fail = lambda h=None: None
+                _M5c.RL.ok = lambda: None
+                _M5c._fallback_get = lambda *a, **k: (
+                    _cnt9.__setitem__("fb", _cnt9["fb"] + 1), None)[1]
+                _M5c.log = lambda m, lv=None: None
+                _M5c._daily_log_once = lambda *a, **k: None
+                _M5c._host_dead = lambda h: False
+                _M5c.PERMANENTLY_DEAD = set()
+                _badurl = "http://127.0.0.1:1/x"   # 关闭端口，立刻失败
+                # 预算充足 → 3 次尝试 + 1 次兜底
+                _cnt9 = {"try": 0, "fb": 0}
+                _M5c.set_data_deadline(time.time() + 120)
+                _M5c.cj(_badurl, retries=3, timeout=1)
+                if _cnt9["try"] != 3 or _cnt9["fb"] != 1:
+                    _bad5 += 1
+                    print(f"  ❌ 预算充足时 cj 应 3 次尝试 + 1 次兜底，"
+                          f"实得 try={_cnt9['try']} fb={_cnt9['fb']} —— "
+                          f"闸门把正常重试也拦了")
+                # 预算耗尽 → 只放行首次，不兜底
+                _cnt9 = {"try": 0, "fb": 0}
+                _M5c.set_data_deadline(time.time() - 1)
+                _M5c.cj(_badurl, retries=3, timeout=1)
+                if _cnt9["try"] != 1 or _cnt9["fb"] != 0:
+                    _bad5 += 1
+                    print(f"  ❌ 预算耗尽时 cj 应只放行首次、不兜底，"
+                          f"实得 try={_cnt9['try']} fb={_cnt9['fb']} —— "
+                          f"重试/兜底链（最坏再 175s）没被拦住")
+            finally:
+                (_M5c.RL.wait, _M5c._fallback_get, _M5c.log,
+                 _M5c._daily_log_once, _M5c._host_dead,
+                 _M5c.PERMANENTLY_DEAD, _M5c.RL.fail,
+                 _M5c.RL.ok) = _sv9
+                _M5c.set_data_deadline(None)
+        except Exception as _e9:
+            _bad5 += 1
+            print(f"  ❌ cj 重试链判据异常: {_e9}")
+
         # ⑦ 慢取数必须留痕 —— 行情/分时两处耗时日志都得在。
         # `[实测]` 11:42 那轮前 143s 全程无日志，只能靠后面 clist 那行
         # 「本轮已用 143s」反推，无法归因到具体哪一步（我当时先误判成 news）。
@@ -11993,7 +12118,9 @@ def _main(ok_all):
             ok_all = False
         else:
             print("  ✅ data_cap 真钳到剩余、无截止不误伤、留痕去重、"
-                  "hot 两处已接、run 按本轮起点设截止、行情/分时耗时留痕")
+                  "hot 两处已接、run 按本轮起点设截止、行情/分时耗时留痕、"
+                  "预算耗尽时 quotes 零发包且不判死主机、"
+                  "cj 重试/兜底链受预算约束")
     except Exception as e:
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False

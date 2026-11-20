@@ -4631,6 +4631,25 @@ MUTANTS = [
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
 
+    # --- 取数入口零发包（2026-11-21，P1）---
+    # `data_cap` 只管 clist/members/量比；quotes（行情/港股/备用源）原先
+    # 完全不受约束 —— 11:42 那轮 143s 就花在这，AI 拿到 0s 预算。
+    ("data-entry-gate-noop",
+     "marketlib.py",
+     '    return _l is not None and _l <= 0',
+     '    return False   # 注入：data_expired 恒假',
+     "[取数入口闸] data_expired 恒假 → 预算耗尽仍照常取数，"
+     "最坏再拖 175s，AI 拿不到预算只能推模板",
+     "预算耗尽时 quotes 仍发"),
+
+    ("data-cj-retry-unbounded",
+     "marketlib.py",
+     '        if i and data_expired():',
+     '        if False:   # 注入：不拦重试',
+     "[取数入口闸] cj 重试链不拦 → 预算耗尽后仍跑满 3 次重试 + 代理/firecrawl"
+     "（最坏再 175s），11:42 走到 300s 就是这么来的",
+     "预算耗尽时 cj 应只放行首次"),
+
     # --- 慢取数留痕（2026-11-20，P1 可观测性）---
     # 11:42 那轮前 143s 全程无日志，只能靠后面 clist 的「本轮已用 143s」
     # 反推，无法归因到具体哪一步（当时先误判成 news）。

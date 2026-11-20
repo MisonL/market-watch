@@ -2422,6 +2422,18 @@ def cj(url, ref=REF_EM, retries=3, timeout=20, limit=True):
     # 减少配额消耗的正确做法是**减少无效发包**（见下面 except 分支对
     # 网关错误页的早退），不是改记账口径。
     for i in range(retries):
+        # ⚠️ 2026-11-21（P1）：取数预算耗尽后**不再追加重试**。
+        # 只拦 `i > 0` 与最后的兜底链，**首次尝试永远放行** ——
+        # 这样"走到这里的每一次 _mark_dead 都对应一次真实发包失败"，
+        # 不会把"没钱了"误记成"主机挂了"（那类假故障本文件记录过两次）。
+        # `[实测]` 单次 cj 最坏链 ≈ 175s（3 次重试 60s + 代理 25s +
+        # firecrawl 90s）；不拦的话，预算 120s 之外还能再拖 175s，
+        # 11:42 那轮就是这么走到 300s 的。
+        if i and data_expired():
+            _daily_log_once(f"budget-stop-{host or ''}", "budget-stop",
+                            f"取数预算已耗尽，停止重试（不再追加发包）: "
+                            f"{url[:60]}")
+            break
         if limit and not RL.wait(host):
             # ⚠️⚠️ 2026-11-05（P1）：必须区分**主机熔断**与**日配额耗尽**。
             # 两者原先同返回 RATE_LIMITED，而 `_try_hosts()` 收到它就直接
@@ -2512,6 +2524,16 @@ def cj(url, ref=REF_EM, retries=3, timeout=20, limit=True):
     # 兜底成功了也不该改变"直连确实不通"这个事实（否则主机不会被标死，
     # 下一轮又白白重试 3 次）。两者互不干扰。
     if limit:
+        # ⚠️ 2026-11-21（P1）：预算耗尽就不再发起兜底链。
+        # 代理 25s + firecrawl 90s 是整条链里**最贵**的尾巴，而它只在
+        # "直连已经失败"之后才走 —— 那时预算早已耗尽，等于纯超支。
+        # `[实测]` 11:40:20「curl 超时(17s)」之后又拖到 11:42:10 的
+        # firecrawl 超时，就是这一段。
+        if data_expired():
+            _daily_log_once(f"budget-no-fb-{host or ''}", "budget-no-fb",
+                            f"取数预算已耗尽，跳过代理/firecrawl 兜底: "
+                            f"{url[:60]}")
+            return None
         # 同样必须传裸主机名（见上方 `_bare_host` 的说明）
         return _fallback_get(url, ref=ref, host=_bare_host, timeout=timeout)
     return None
@@ -3829,6 +3851,15 @@ def quotes(ids, fields="f2,f3,f6,f12,f14,f24,f62,f104,f105,f184",
         """
         got = {}
         for host in em_hosts:
+            # ⚠️ 2026-11-21（P1）：预算耗尽就不再开始**新的**主机尝试。
+            # 必须在调 `_fetch`/`cj` **之前**判 —— 在这里跳过不会有任何
+            # 网络失败，因此也不会触发下面的 `_mark_dead`（假故障）。
+            # 已经拿到的那部分 `got` 原样返回（部分数据仍有价值）。
+            if data_expired():
+                _daily_log_once(f"budget-stop-hosts-{tag}", "budget-hosts",
+                                f"取数预算已耗尽，{tag} 停止尝试剩余主机"
+                                f"（已取 {len(got)}/{len(codes)} 项）")
+                break
             hn = _host_of(host)          # 裸主机名：用于 PERMANENTLY_DEAD（与协议无关）
             hk = _host_key(host)         # 协议+主机：用于健康度/判死（两种协议必须分开）
             # ⚠️ 永久封锁的主机**不参与尝试**（2026-10-22）。
@@ -3916,8 +3947,31 @@ def quotes(ids, fields="f2,f3,f6,f12,f14,f24,f62,f104,f105,f184",
         return got
 
     if a:
-        out.update(_try_hosts(a, "A股/板块"))
+        # ⚠️ 2026-11-21（P1）：`_try_hosts` 内部也有闸，但这里再判一次是
+        # 为了**不打无谓的日志**（否则每台主机都记一条"预算耗尽"）。
+        if data_expired():
+            _daily_log_once("budget-skip-a", "budget-skip",
+                            "取数预算已耗尽，跳过 A 股/板块取数（本轮盘面将缺失）")
+        else:
+            out.update(_try_hosts(a, "A股/板块"))
+    # ⚠️⚠️ 2026-11-21（P1）：这一段必须放在 `if hk:` **之前**。
+    # 第一版我写在了 `if hk:` 内部 —— `hk = []` 在 block 里赋值**不会**
+    # 让已进入的 block 退出，港股照样去调腾讯、失败后又走 EM 回退
+    # （实测零发包验证时 cj 与腾讯各被调了 1 次，闸门形同虚设）。
+    # 这正是"闸门在 ≠ 闸门生效"的又一次现场复现。
+    if hk and data_expired():
+        _daily_log_once("budget-skip-hk", "budget-skip",
+                        "取数预算已耗尽，跳过港股取数（本轮港股将缺失）")
+        # ⚠️ 用**清空 hk** 而不是 `return out`：后者会跳过本函数末尾的
+        # 别名补全与「新鲜度闸门」，等于顺手改了两处无关行为
+        # （A 股短码别名不再补、陈旧行情闸门不再卡）。清空后自然落到
+        # 公共收尾，语义最小。
+        hk = []
     if hk:
+        # ⚠️ 2026-11-21（P1）：港股走腾讯的独立路径（不走 cj），
+        # 原先**完全不受全局上限约束** —— `[实测]` 11:40:20 那条
+        # 「curl 超时(17s): qt.gtimg.cn」之后一路拖到 11:42:15
+        # 「腾讯空响应（熔断/配额/兜底全败）」，近 2 分钟。
         # ---------- 港股：唯一可信路径是腾讯 ----------
         # 不要改成 _try_hosts()！实测 EM_TEST(push2test) 的港股 f2/f3
         # 字段口径与 A 股完全不同，返回的是**有限正数但错误的数**：
@@ -4039,6 +4093,12 @@ def quotes(ids, fields="f2,f3,f6,f12,f14,f24,f62,f104,f105,f184",
 
     # 备用源：补齐仍未取到的（港股必走这里，板块备用源无覆盖）
     miss = [i for i in ids if i not in out and i.split(".")[-1] not in out]
+    # ⚠️ 2026-11-21（P1）：备用源补齐**同样是网络请求**，预算耗尽必须跳。
+    # 漏了这里，前面几道闸等于白设 —— 没取到的标的会全部涌进备用源。
+    if miss and data_expired():
+        _daily_log_once("budget-skip-backup", "budget-skip",
+                        f"取数预算已耗尽，跳过备用源补齐（{len(miss)} 项缺失）")
+        miss = []
     if miss:
         try:
             import feeds
@@ -4362,6 +4422,26 @@ def data_left():
     if not isinstance(_d, (int, float)):
         return None
     return _d - time.time()
+
+
+def data_expired():
+    """本轮取数预算是否**已耗尽**（未设截止时恒为 False）。
+
+    ⚠️ 与 `data_cap` 的分工：`data_cap` 管"这一路取数还剩多少秒可用"，
+    本函数管"**还能不能开始新的取数**"。两者都基于 `data_left()`。
+
+    ⚠️⚠️ 为什么必须在**调用方**判而不是只在 `cj()` 里判：
+    `cj()` 拿不到"这次失败是预算掐的还是主机挂了"这个区分，若它直接返回
+    None，`_try_hosts` 会把主机 `_mark_dead` —— 零发包却盖上 30 分钟死亡戳，
+    正是本文件反复记录的那类假故障（2026-10-22 / 09-24 两次实测）。
+    所以在**发起之前**由调用方判定并跳过，`cj()` 里只做"不追加重试"。
+
+    `[实测]` 2026-11-20 11:42：取数用满 300s 的构成里，143s 花在
+    quotes/trend，而这两路**当时完全不受全局上限约束**（`data_cap` 只管
+    clist/members/量比）。结果是 AI 拿到 0s 预算、整轮推模板。
+    """
+    _l = data_left()
+    return _l is not None and _l <= 0
 
 
 def data_cap(own_s, what=""):
