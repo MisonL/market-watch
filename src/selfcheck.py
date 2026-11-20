@@ -11979,12 +11979,21 @@ def _main(ok_all):
                 _bad5 += 1
                 print("  ❌ set_data_deadline 必须以 `_t0 + DATA_BUDGET` 调用 —— "
                       "否则截止点与轮次起点脱钩，上限形同虚设")
+        # ⑦ 慢取数必须留痕 —— 行情/分时两处耗时日志都得在。
+        # `[实测]` 11:42 那轮前 143s 全程无日志，只能靠后面 clist 那行
+        # 「本轮已用 143s」反推，无法归因到具体哪一步（我当时先误判成 news）。
+        _miss7 = [n for n in ("取数耗时：行情", "取数耗时：分时补取")
+                  if n not in _an5]
+        if _miss7:
+            _bad5 += 1
+            print(f"  ❌ 缺慢取数耗时日志 {_miss7} —— "
+                  f"慢轮只能看到「本轮已用 N 秒」，看不出是哪一步吃的")
         if _bad5:
             print(f"  ❌ {_bad5} 项取数全局上限判据不成立")
             ok_all = False
         else:
             print("  ✅ data_cap 真钳到剩余、无截止不误伤、留痕去重、"
-                  "hot 两处已接、run 按本轮起点设截止")
+                  "hot 两处已接、run 按本轮起点设截止、行情/分时耗时留痕")
     except Exception as e:
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False

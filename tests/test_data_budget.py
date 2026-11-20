@@ -312,7 +312,10 @@ def _exec_gate(marker, left, extra):
     check(_blk is not None, f"取不到「{marker}」闸门的真实语句块")
     if _blk is None:
         return {}
-    _ns = {"M": _FakeM(left)}
+    # ⚠️ 闸门 if 块里引用 `time`（如 news 闸上方的 `_dl2` 计算段，
+    # 或某些块的日志时间戳），exec 的作用域必须自带 time，
+    # 否则会抛 NameError —— 那会让"行为判据"变成"环境判据"。
+    _ns = {"M": _FakeM(left), "time": time}
     _ns.update(extra)
     _code = "\n".join(ast.unparse(_x) for _x in _blk)
     exec(compile(_code, "<gate>", "exec"), _ns)   # noqa: S102
@@ -359,4 +362,78 @@ check(_c6.n == 1,
       "data_left()=None（本轮未设截止）时必须照常取数，实得跳过 —— "
       "会把 collect 等无截止场景一起误伤")
 
-print(f"ALL PASS (取数全局上限 + 编排层闸门 {_ok} 个断言)")
+
+# ---------- ⑦ 慢取数必须留痕（2026-11-20，P1 可观测性）----------
+#
+# `[实测]` 11:42 那轮 300s 里，前 143s 全花在 quotes/trend/detect，
+# 而日志从 11:35:47 到 11:38:05 **完全空白** —— 只能靠后面 clist 那行
+# 「本轮已用 143s」反推"前面吃掉了 143s"，**是哪一步吃的、为什么吃，
+# 一点线索都没有**。我当时先误判成"news 占 149s"，翻出 clist 那行才纠正。
+#
+# 这类"慢但无声"的段落，事后排查成本远高于当初加两行日志。
+# 这里锁两件事：① 两处耗时日志都在；② 慢的时候真的会打（假时钟测，不 sleep）。
+_an7 = _an
+check(_an7.count("取数耗时：行情") == 1,
+      f"缺「取数耗时：行情」日志（实得 {_an7.count('取数耗时：行情')} 处）"
+      f"—— 慢轮无法归因")
+check(_an7.count("取数耗时：分时补取") == 1,
+      f"缺「取数耗时：分时补取」日志（实得 {_an7.count('取数耗时：分时补取')} 处）")
+
+# 行为级：用假 time 模块把"耗时 6.1s"喂进去，确认日志真的产生
+class _FakeTime:
+    """可控时钟：time() 依次返回 t0, t0+6.1，制造"这一步花了 6.1s"。"""
+    def __init__(self):
+        self.t = 1000.0
+        self.step = 0.0
+
+    def time(self):
+        v = self.t
+        self.t += self.step if self.step else 0.0
+        return v
+
+    def sleep(self, s):
+        pass
+
+
+import analyze as _A7
+import marketlib as _M7
+_ft = _FakeTime()
+_ft.step = 6.1
+_save_time = _A7.time
+_save_q = _A7._quotes_from_snapshot
+_save_qs = _A7._quotes
+_save_log7 = _M7.log
+_logs7 = []
+
+
+def _cap(m, lv=None):
+    _logs7.append(str(m))
+
+
+try:
+    _A7.time = _ft
+    _M7.log = _cap
+    _A7.M.log = _cap
+    _A7._quotes_from_snapshot = lambda now=None: {}     # 强制走实时取数
+    _A7._quotes = lambda ids: {}
+    import datetime as _dt7
+    _now7 = _dt7.datetime.now()
+    try:
+        _A7.run(_now7, force=True, dry=True,
+                hm=_now7.hour * 60 + _now7.minute)
+    except Exception:
+        pass          # 后面缺数据会早退，只要日志产生即可
+finally:
+    _A7.time = _save_time
+    _A7._quotes_from_snapshot = _save_q
+    _A7._quotes = _save_qs
+    _M7.log = _save_log7
+    _A7.M.log = _save_log7
+
+_hit7 = [x for x in _logs7 if "取数耗时" in x]
+check(_hit7,
+      f"行情慢 6.1s 时没产生「取数耗时」日志（捕捉到 {len(_logs7)} 条日志）—— "
+      f"日志代码在 ≠ 日志会打")
+check(any("行情" in x for x in _hit7), f"耗时日志里没有行情段：{_hit7[:2]}")
+
+print(f"ALL PASS (取数全局上限 + 编排层闸门 + 慢取数留痕 {_ok} 个断言)")

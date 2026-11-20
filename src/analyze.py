@@ -5441,9 +5441,22 @@ def run(now, force, dry, hm, _t0=None):
     # ⚠️ 复用只覆盖**行情与分时**两路；板块资金(clist)、快讯仍各取所需
     # （clist 扫的是全市场 496 板块，用于发现固定 12 板块列表**之外**的异动，
     #  与 quotes() 不是同一份数据；快讯只有 collect 取）。
+    # ⚠️⚠️ 2026-11-20（P1 可观测性）：这两步原先**一行日志都不打**。
+    # `[实测]` 11:42 那轮 300s 里，前 143s 全在这里，而日志从 11:35:47
+    # 到 11:38:05 是**完全空白**的 —— 只能事后靠"clist 日志说本轮已用 143s"
+    # 反推出"前面吃掉了 143s"，但**是哪一步吃的、为什么吃的，一点线索都没有**。
+    # 那次我先误判成 "news 占 149s"，直到翻出 clist 那行才纠正。
+    # 这类"慢但无声"的段落，事后排查成本远高于当初加两行日志。
+    _td_q = time.time()
     q = _quotes_from_snapshot(now=now)
-    if not isinstance(q, dict) or not q:
+    _from_snap = isinstance(q, dict) and bool(q)
+    if not _from_snap:
         q = _quotes(ids)
+    _dq = time.time() - _td_q
+    if _dq >= 5:
+        M.log(f"取数耗时：行情 {'快照复用' if _from_snap else '实时取数'} "
+              f"{_dq:.1f}s（标的 {len(ids)} 个）—— 超过 5s 才记，"
+              f"慢轮据此归因", "FEED")
     # 分时同理：collect 刚取过并写进了快照的 storage（字段与 trend() 一一对应）。
     sg = _storage_from_snapshot(now=now)
     if not isinstance(sg, dict):
@@ -5459,7 +5472,11 @@ def run(now, force, dry, hm, _t0=None):
             M.log(f"取数全局上限已到（超出 {-_dl:.0f}s），跳过分时补取 —— "
                   f"detect 少几条分时判定，但不再拖整轮", "FEED")
         else:
+            _td_s = time.time()
             sg = _trend("90.BK1137")
+            _ds = time.time() - _td_s
+            if _ds >= 5:
+                M.log(f"取数耗时：分时补取 {_ds:.1f}s —— 慢轮据此归因", "FEED")
     hits=detect(q,sg,now,st)
     # ⚠️ 开盘前（session 起点 09:25 之前）**不产出事件类 hits**。
     #
