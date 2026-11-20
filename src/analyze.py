@@ -5447,7 +5447,19 @@ def run(now, force, dry, hm, _t0=None):
     # 分时同理：collect 刚取过并写进了快照的 storage（字段与 trend() 一一对应）。
     sg = _storage_from_snapshot(now=now)
     if not isinstance(sg, dict):
-        sg = _trend("90.BK1137")
+        # ⚠️ 2026-11-20（P1）：分时是**次要**数据（只喂 detect 的几条判定），
+        # 取数预算已耗尽时跳过它，把剩下的时间留给 AI 与推送。
+        # `[实测]` 2026-11-20 11:42：0~138s 全耗在 quotes/trend/detect 的
+        # 静默段（期间一条日志都没有），等走到 hot 时预算早超了，
+        # 整轮 300s、AI 一次没跑、推送只剩 406 字且「热点」段是空的。
+        # 判据用 `M.data_left()`（与 clist/members/量比同一个时钟），
+        # 为负说明本轮取数已越过 120s 上限。
+        _dl = M.data_left()
+        if _dl is not None and _dl <= 0:
+            M.log(f"取数全局上限已到（超出 {-_dl:.0f}s），跳过分时补取 —— "
+                  f"detect 少几条分时判定，但不再拖整轮", "FEED")
+        else:
+            sg = _trend("90.BK1137")
     hits=detect(q,sg,now,st)
     # ⚠️ 开盘前（session 起点 09:25 之前）**不产出事件类 hits**。
     #
@@ -7965,7 +7977,23 @@ def _run_after_inflight(now, force, dry, hm, st, q, sg, hits, hourly, urgent,
         _log(f"HOT EXC {e}")
     try:
         import news as NEWS
-        ns=NEWS.fetch_news(80)
+        # ⚠️⚠️ 2026-11-20（P1）：快讯是**可选增强**，取数预算耗尽时必须跳过。
+        # `[实测]` 2026-11-20 11:42 那轮 300s 的构成：
+        #     0~138s  quotes/trend/detect（静默）
+        #     138~151s clist/members（已被 120s 上限钳住，立即放弃）
+        #     151~300s **news**（含 11:40:20 的 17s curl 超时）
+        # 代价很不对称：news 只影响 brief 里几行"相关快讯"，
+        # 而它跑满会让 AI 拿到 0s 预算 —— 那一轮 AI 完全没跑，
+        # 推出去的是 406 字残稿（「热点」段头下空无一字），
+        # 还饿死 1 次触发（`starved_slots=1`）。
+        # 判据与上面 trend 闸同源（`M.data_left()`），为负就跳过。
+        _dl2 = M.data_left()
+        if _dl2 is not None and _dl2 <= 0:
+            M.log(f"取数全局上限已到（超出 {-_dl2:.0f}s），跳过快讯取数 —— "
+                  f"brief 少几行相关新闻，但把时间留给 AI", "FEED")
+            ns = []
+        else:
+            ns=NEWS.fetch_news(80)
         # 同 build_brief：strong 的形状必须显式判（见那里的注释）
         _strong2 = hot.get("strong") if isinstance(hot, dict) else None
         if isinstance(_strong2, list) and _strong2:

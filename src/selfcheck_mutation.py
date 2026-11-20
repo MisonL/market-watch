@@ -4631,6 +4631,30 @@ MUTANTS = [
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
 
+    # --- 取数编排层闸门（2026-11-20，P1）---
+    # `[实测]` 11:42 那轮 300s：138s quotes/trend + 13s clist(已钳) + 149s news。
+    # news 跑满让 AI 拿到 0s → 406 字残稿（热点段空）+ 饿死 1 次触发。
+    # 判据在 tests/test_data_budget.py（AST 级别：条件真的求值预算、
+    # body 真的跳过、else 真的仍取数）。
+    ("data-gate-trend-noop",
+     "analyze.py",
+     "        if _dl is not None and _dl <= 0:",
+     "        if False:   # 注入：分时闸门失效",
+     "[取数编排闸] trend 闸条件变常量 False → 预算耗尽仍去补取分时，"
+     "138s 那种静默段照旧拖满整轮",
+     # ⚠️ 期望串逐字取自 selfcheck 真正打出的 ❌ 行首段，
+     # 不是 tests/ 的断言措辞（该工具只认「本轮新增失败行」，
+     # 写错 = 明明抓住却报漏网，见 push-split 那两条的同类教训）。
+     "trend 闸的条件没求值预算"),
+
+    ("data-gate-news-noop",
+     "analyze.py",
+     "            ns = []",
+     "            pass   # 注入：只打日志不置空",
+     "[取数编排闸] news 闸只打日志、不置空 ns → 分支等于没写，"
+     "快讯取数照旧跑满（那是 11:42 那轮 300s 里的 149s）",
+     "news 闸 body 没把 ns 置空"),
+
     # --- 推送排版拆行阈值（2026-11-20，用户「优化一下排版」）---
     # 盘面段 129 字距旧阈值 132 只差 3 字 → 不触发，手机上折 8 行无缩进。
     # 判据在 tests/test_push_layout.py（引用 A._SPLIT_LIMIT，不抄数字）。

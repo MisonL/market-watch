@@ -11781,6 +11781,103 @@ def _main(ok_all):
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
 
+    # 14e-3) 取数编排层闸门 —— 预算耗尽时必须真的跳过 trend/news 取数。
+    #
+    # ⚠️ 为什么判据必须在**自检**里（与 14e-2 同理）：变异测试跑的是自检。
+    # 只放 tests/ 的话，把 `if _dl is not None and _dl <= 0:` 改成
+    # `if False:` 这类回归**变异体会判漏网**。
+    #
+    # `[实测]` 2026-11-20 11:42：那轮 300s 的构成是
+    #     0~138s quotes/trend/detect（静默）+ 138~151s clist/members（已钳）
+    #     + 151~300s **news**。news 跑满让 AI 拿到 0s 预算 → 推出去 406 字
+    #     残稿（「热点」段头下空无一字）且饿死 1 次触发（starved_slots=1）。
+    #
+    # ⚠️ 判据用 **AST** 而不是字符串/缩进 —— 第一版我写的是「源码里有没有
+    # `_trend(`、缩进够不够」，注入 `if False:` 后**断言照样全绿**：
+    # `_trend(` 还在 else 里、缩进也没变。那测的是"这段代码长这样"，
+    # 不是"闸门会生效"（本仓库反复的形态）。
+    print("\n[取数编排闸]")
+    try:
+        import ast as _ast3
+        _src3 = open(os.path.join(MAIN_ROOT, "analyze.py"),
+                     encoding="utf-8").read()
+        _tree3 = _ast3.parse(_src3)
+        _bad3 = 0
+
+        def _innermost_if(marker):
+            # 取**最内层**含 marker 的 if：外层 `if not isinstance(sg, dict):`
+            # 的 body 里就嵌着闸门，unparse(外层) 也含 marker，
+            # "第一个匹配"会永远返回外层，判的就不是闸门本身。
+            _c = []
+            for _n in _ast3.walk(_tree3):
+                if isinstance(_n, _ast3.If) and marker in _ast3.unparse(_n):
+                    _c.append((sum(1 for _ in _ast3.walk(_n)), _n))
+            if not _c:
+                return None
+            _c.sort(key=lambda x: x[0])
+            return _c[0][1]
+
+        # ① trend 闸
+        _i1 = _innermost_if("跳过分时补取")
+        if _i1 is None:
+            _bad3 += 1
+            print("  ❌ 找不到「跳过分时补取」的 if 闸门 —— "
+                  "预算耗尽仍会去补取分时，138s 那种静默段照旧拖满整轮")
+        else:
+            _t1 = _ast3.unparse(_i1.test)
+            if "data_left" not in _t1 and "_dl" not in _t1:
+                _bad3 += 1
+                print(f"  ❌ trend 闸的条件没求值预算（test={_t1!r}）—— "
+                      f"闸门在 ≠ 闸门生效")
+            if not _i1.orelse:
+                _bad3 += 1
+                print("  ❌ trend 闸没有 else —— 预算充足时分时永远不取")
+            else:
+                _e1 = _ast3.unparse(
+                    _ast3.Module(body=_i1.orelse, type_ignores=[]))
+                if "_trend(" not in _e1:
+                    _bad3 += 1
+                    print(f"  ❌ trend 闸 else 不再调 _trend（{_e1[:90]!r}）")
+
+        # ② news 闸
+        _i2 = _innermost_if("跳过快讯取数")
+        if _i2 is None:
+            _bad3 += 1
+            print("  ❌ 找不到「跳过快讯取数」的 if 闸门 —— "
+                  "那是 11:42 那轮 300s 里的 149s")
+        else:
+            _t2 = _ast3.unparse(_i2.test)
+            if "data_left" not in _t2 and "_dl2" not in _t2:
+                _bad3 += 1
+                print(f"  ❌ news 闸的条件没求值预算（test={_t2!r}）")
+            _b2 = _ast3.unparse(
+                _ast3.Module(body=_i2.body, type_ignores=[]))
+            if "ns = []" not in _b2 and "ns=[]" not in _b2:
+                _bad3 += 1
+                print(f"  ❌ news 闸 body 没把 ns 置空（{_b2[:120]!r}）—— "
+                      f"只打日志不置空 = 分支等于没写")
+            _e2 = _ast3.unparse(
+                _ast3.Module(body=_i2.orelse, type_ignores=[]))
+            if "fetch_news" not in _e2:
+                _bad3 += 1
+                print(f"  ❌ news 闸 else 不再调 fetch_news（{_e2[:90]!r}）")
+
+        # ③ 两处闸必须用**同一个**时钟（`M.data_left()`）
+        if _src3.count("M.data_left()") < 2:
+            _bad3 += 1
+            print(f"  ❌ 少于 2 处 data_left() 闸 —— "
+                  f"trend 与 news 必须同源判据，实得 {_src3.count('M.data_left()')}")
+
+        if _bad3:
+            print(f"  ❌ {_bad3} 项编排闸判据不成立")
+            ok_all = False
+        else:
+            print("  ✅ trend/news 两处闸门条件真的求值预算、body 真的跳过、"
+                  "else 真的仍取数，且同源 data_left()")
+    except Exception as e:
+        _unverified[0] += 1
+        print(f"  ❌ {e}"); ok_all = False
+
     # 14f) 静态未绑定调用 —— 调用了一个**既未定义也未导入**的名字。
     #
     # ⚠️ 为什么必须有这一项：这类错误在运行期表现为 NameError，而它几乎总是
