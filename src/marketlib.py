@@ -4309,6 +4309,85 @@ def trend(sid):
     return {"last": px[-1], "high": hi, "low": min(px), "open": px[0],
             "vol": sum(vol), "am": am, "pm": sum(vol) - am}
 
+# ==================== 取数阶段的**全局**时间上限（2026-11-20，P1）==========
+# 为什么需要：取数阶段原先只有**各数据源自己的**预算，没有总数。
+# `[实测]` 三个子预算可以叠加到 180s：
+#     hot.fetch_sectors 的 clist  60s
+#     hot.MEMBERS_BUDGET          40s
+#     hot.VR_BUDGET                80s
+# 而 `AI_ROUND_BUDGET`(240s) 是**减去取数耗时**再给 AI 的（见
+# analyze.ai_analyze 的 `_used` 计算）—— 取数吃到 172s 时 AI 只剩 68s，
+# 而成功轮 AI 耗时的 P90 是 140s、最长 210s ⇒ 结构性必死。
+# `[实测]` 2026-11-18 14:54：取数 172s → AI 上限 68s → 退模板，
+# 日志里「量比预算 80s 用尽」与「members 预算用尽」同时出现。
+#
+# 实测分布（近 20 天 986 轮 `data_ms`）：P50=0.1s P90=13.6s P99=75s
+# 最大 171.8s；>60s 只占 1.6%，>90s 占 0.6%。故取 120s 作硬上界 ——
+# 截掉长尾，正常轮次（P99=75s）完全不受影响。
+#
+# ⚠️ 语义是**软上限**：到期不是杀进程，而是"各数据源不再开新活"，
+# 已拿到的部分照常使用（与 clist 的 budget_s 同款取舍 —— 半份数据比
+# 没有更糟，但"再花 80s 去补最后 5% 板块"更糟）。
+# ⚠️ 只约束 `clist()` 与 hot 的三个循环，**不约束 `cj()` 单次超时**：
+# 把 20s 的 timeout 压到 3s 会让本来能成功的请求失败，是另一类错误。
+DATA_BUDGET = 120
+
+# 单元素可变容器（同 `_lock_fd` 的写法）：模块级 None 无法被别的模块回写。
+_DATA_DEADLINE = [None]
+
+
+# 本轮哪些数据源被全局上限**真的**钳过（用于每轮只记一次日志）。
+_DATA_CAPPED: set = set()
+
+
+def set_data_deadline(ts=None):
+    """设置本轮取数的硬截止时刻（墙钟秒）。`None` = 不限制（默认）。"""
+    _DATA_DEADLINE[0] = ts
+    _DATA_CAPPED.clear()
+
+
+def data_left():
+    """距取数截止还剩多少秒；未设截止返回 None（调用方据此跳过钳制）。
+
+    ⚠️ 返回值**可能是负数**（已超时）—— 刻意不钳到 0：调用方用
+    `max(0.5, ...)` 之类的下限保证单次请求仍有最小预算，钳成 0 会让
+    `budget_s=0` 变成"一页都不翻"，反而拿不到已到手的第一页。
+    """
+    _d = _DATA_DEADLINE[0]
+    if not isinstance(_d, (int, float)):
+        return None
+    return _d - time.time()
+
+
+def data_cap(own_s, what=""):
+    """把某个数据源自己的预算 `own_s` 钳到"全局剩余"以内（取较小者）。
+
+    任一为 None 时取另一个；都为 None 返回 None（= 不限制）。
+
+    ⚠️ 钳到了就**记一条日志**（每个 `what` 每轮只记一次）。
+    理由是本仓库反复的那类缺陷：**降级必须留痕**。全局上限一旦生效，
+    该数据源本轮就拿不全（量比全按 1.0 → 排序失真；成分股缺失 →
+    热点榜变子集），而这在推送里看不出来。不记日志的话，事后只能靠
+    "这一轮热点榜怪怪的"去猜。`what` 为空时按"未命名"去重。
+    """
+    _left = data_left()
+    if _left is None:
+        return own_s
+    if own_s is None:
+        _cap = _left
+    else:
+        _cap = min(own_s, _left)
+    if own_s is not None and _cap < own_s:
+        _k = what or "未命名"
+        if _k not in _DATA_CAPPED:
+            _DATA_CAPPED.add(_k)
+            log(f"取数全局上限生效：{_k} 自身预算 {own_s:.0f}s 被压到 "
+                f"{_cap:.0f}s（全局 {DATA_BUDGET}s，本轮已用 "
+                f"{DATA_BUDGET - _left:.0f}s）—— 该源本轮取不全，"
+                f"结果按已有部分使用", "FEED")
+    return _cap
+
+
 def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
           with_total=False):
     """板块列表（clist）。该接口收盘后常被限流，失败返回空列表。
@@ -4332,6 +4411,11 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
     """
     out = []
     _t0 = time.monotonic()
+    # 2026-11-20（P1）：先按**全局**取数上限钳一次自己的预算。
+    # 各数据源自己的 budget_s 是"我是这段活的上限"，而全局 deadline 是
+    # "整轮取数还剩多少" —— 后者更紧时必须听后者，否则三个子预算又能
+    # 叠加到 180s（见 DATA_BUDGET 的注释）。
+    budget_s = data_cap(budget_s, what=f"clist({fs})")
     _total = None
     _seen = set()          # 已取到的 f12，用于跨页去重与防死循环
     for pn in range(1, max_pn+1):

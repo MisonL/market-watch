@@ -4631,6 +4631,43 @@ MUTANTS = [
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
 
+    # --- 取数全局上限（2026-11-20，P1）---
+    # `AI_ROUND_BUDGET` 是「240s − 取数耗时」。取数阶段原先没有总数，
+    # 三个子预算（60+40+80）能叠到 180s ⇒ AI 只剩 60s 而 P90 要 140s ⇒
+    # 慢轮必退模板。判据在 tests/test_data_budget.py。
+    ("data-budget-cap-ignored",
+     "marketlib.py",
+     '    _left = data_left()\n    if _left is None:\n        return own_s',
+     '    _left = None  # 注入：无视全局上限\n    if _left is None:\n        return own_s',
+     "[取数全局上限] data_cap 无视全局剩余 → 三个子预算照旧叠加到 180s，"
+     "AI 只剩 60s 而 P90 要 140s，慢轮必退模板（2026-11-18 14:54 实测形态）",
+     "全局 30s 更紧时应取 30"),
+
+    ("data-budget-vr-unwired",
+     "hot.py",
+     'vr_deadline = time.time() + M.data_cap(VR_BUDGET, "量比")',
+     'vr_deadline = time.time() + VR_BUDGET',
+     "[取数全局上限] 量比自算没被全局上限钳 → 冷启动那轮它独自能吃 80s，"
+     "取数总耗时照样能到 172s（AI 上限掉到 68s）",
+     "hot.py 应有 ≥2 处 data_cap"),
+
+    ("data-budget-not-set-per-round",
+     "analyze.py",
+     '        M.set_data_deadline((_t0 if isinstance(_t0, (int, float))\n'
+     '                             else time.time()) + M.DATA_BUDGET)',
+     '        M.set_data_deadline(None)',
+     "[取数全局上限] run() 没按本轮起点设截止（或设成 None）→ 全局上限"
+     "永不生效，等于没做这个修复",
+     "set_data_deadline 必须以 `_t0 + DATA_BUDGET` 调用"),
+
+    ("data-budget-cap-silent",
+     "marketlib.py",
+     '    if own_s is not None and _cap < own_s:',
+     '    if False and own_s is not None and _cap < own_s:',
+     "[取数全局上限] 钳制不留痕 → 该源本轮取不全（量比全按 1.0、热点榜变"
+     "子集）而推送里看不出来，事后只能靠「这轮怪怪的」去猜",
+     "同一数据源一轮内只该记 1 条降级日志"),
+
     # --- AI 终止归因落盘（2026-11-20，P1）---
     # `ai_fallback` 只说"退了模板"，不说"为什么"。2026-11-19 自检因此把
     # 4 轮「我方预算掐的」+1 轮「通道挂起」合并报成「AI 通道实质不可用 →

@@ -568,7 +568,11 @@ def kline_stats(code, today_amt, now=None, budget_s=None):
     return today_amt / (base * _cum_ratio(elapsed)), ret63
 
 def analyze(top=8):
-    _mem_deadline[0] = time.time() + MEMBERS_BUDGET
+    # ⚠️ 2026-11-20（P1）：自己的 40s 还要再被**全局取数上限**钳一次。
+    # 三个子预算（clist 60s + members 40s + 量比 80s）能叠加到 180s，
+    # 而 AI 的预算是「240s − 取数耗时」—— 取数越慢 AI 越没时间，
+    # 慢轮必然退模板。见 `marketlib.DATA_BUDGET` 的实测分布。
+    _mem_deadline[0] = time.time() + M.data_cap(MEMBERS_BUDGET, "members")
     raw=fetch_sectors()
     rows=[]
     for x in raw:
@@ -666,7 +670,8 @@ def analyze(top=8):
     # 最坏 40×3×25 = 3000 秒 —— 实测沙箱冷启动跑 6 分 42 秒仍在算。
     # 而 cron 间隔只有 300 秒，这轮跑不完下轮就叠上来。
     # 故设整轮硬预算：超时就用已有基线（vr 缺失的按 1.0 处理，排序略失真但能出报告）。
-    vr_deadline = time.time() + VR_BUDGET
+    # 同上：自身 80s 预算再被全局上限钳一次（见 `_mem_deadline` 的注释）。
+    vr_deadline = time.time() + M.data_cap(VR_BUDGET, "量比")
     vr_done = 0
     for r in head:
         if time.time() > vr_deadline:

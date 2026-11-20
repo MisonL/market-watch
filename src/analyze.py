@@ -5420,6 +5420,20 @@ def _close_slot_stale(slot, q):
 def run(now, force, dry, hm, _t0=None):
     # `_ROUND_TDETECT` 在下面 detect() 之后赋值（见其定义处说明）。
     global _ROUND_TDETECT
+    # ⚠️ 2026-11-20（P1）：本轮取数的**全局**硬截止。
+    # 取数阶段原先只有各数据源自己的预算（clist 60s + members 40s +
+    # 量比 80s），加起来能到 180s，而 `AI_ROUND_BUDGET`(240s) 要**减去**
+    # 取数耗时再给 AI —— 取数吃到 172s 时 AI 只剩 68s，而成功轮 AI 的
+    # P90 是 140s ⇒ 必然退模板（2026-11-18 14:54 / 11-19 09:23 实测）。
+    # 见 `marketlib.DATA_BUDGET` 的分布数据。这里设的是**软**截止：
+    # 到期各数据源不再开新活，已拿到的照常使用。
+    # 用 `_t0`（本轮起点，墙钟）而不是重新取时钟：与 `_ROUND_DATA_MS`
+    # 的口径同源，否则"取数耗时没有超预算"这句话会自相矛盾。
+    try:
+        M.set_data_deadline((_t0 if isinstance(_t0, (int, float))
+                             else time.time()) + M.DATA_BUDGET)
+    except Exception:
+        pass
     st=load_st()
     ids = index_secids() + watch_secids() + hk_secids()
     # 先试复用 collect 刚写的快照（两者取的标的集合完全相同，见
