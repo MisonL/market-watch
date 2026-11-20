@@ -11691,6 +11691,96 @@ def _main(ok_all):
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
 
+    # 14e-2) 推送排版拆行 —— 超长段必须拆成手机可读的短行。
+    #
+    # ⚠️ 为什么这一项必须在**自检**里而不是只在 tests/ 里：
+    # 变异测试跑的是自检（`selfcheck_mutation.py` 注入缺陷后看 selfcheck 的
+    # rc/❌），判据只放在 tests/ 的话，把阈值改回 132 这类回归**变异体会
+    # 判漏网** —— `[实测]` 我加完锚点后手动注入 `_SPLIT_LIMIT=132`，
+    # 自检 rc=0 一条 ❌ 都没有，正是这个形态。
+    #
+    # 判据三件事（都是"改坏了影响每一条推送"的量级）：
+    #   ① 阈值是「4 行屏宽」量级（22 字/行），不是旧值 132（6 行）
+    #   ② 函数体真的用模块常量，不是自己另写一个数字
+    #      （否则调常量时生产不变、测试跟着变，两者静默分叉）
+    #   ③ 真实生产正文（129 字那段）确实被拆开且内容零丢失
+    print("\n[推送排版拆行]")
+    try:
+        import analyze as _AN2
+        # ⚠️ `ast` 在本文件**没有模块级导入**（各处都是函数内 `import ast as _x`）。
+        # 裸写 `ast.walk` 会抛 NameError，被下面的 `except Exception` 记成
+        # "未验证" —— 那样本项等于永远不生效（本仓库反复的形态：
+        # 检查项自己静默失效，比没有检查更糟，因为它给出的是假阴性）。
+        import ast as _ast2
+        # ⚠️⚠️ `re` 也不行 —— `_main` 在**第 15249 行**有一个迟到的
+        # `import re`，这会让 `re` 在整个 `_main` 作用域里变成**局部名**。
+        # 于是本段（11700 行左右）任何 `re.sub` 都会抛
+        # 「cannot access local variable 're' where it is not associated
+        #   with a value」——不是没导入，而是"导入还没执行到"。
+        # `[实测]` 第一版就是这么挂的：自检报 ❌ 且只记为未验证。
+        # 修法：另起一个别名，不碰 `re` 这个名。
+        import re as _re2
+        _bad2 = 0
+        # ① 阈值量级
+        if getattr(_AN2, "_SPLIT_LIMIT", None) is None:
+            _bad2 += 1
+            print("  ❌ 缺少 `_SPLIT_LIMIT` 常量 —— 阈值散落在函数体里，"
+                  "测试与生产会各抄一份")
+        elif _AN2._SPLIT_LIMIT > 110:
+            _bad2 += 1
+            print(f"  ❌ 拆行阈值 {_AN2._SPLIT_LIMIT} 太宽（22 字/行下超过 "
+                  f"5 行就是一堵墙）—— 规则⑤要求 2~4 个短段；"
+                  f"2026-11-20 用户截图反馈的正是 132 时代漏拆的形态")
+        # ② 函数体引用常量（ast 静态查，防"常量被旁路"）
+        _src2 = open(os.path.join(MAIN_ROOT, "analyze.py"),
+                     encoding="utf-8").read()
+        _fn2 = None
+        for _n2 in _ast2.walk(_ast2.parse(_src2)):
+            if (isinstance(_n2, _ast2.FunctionDef)
+                    and _n2.name == "_split_wall_lines"):
+                _fn2 = _n2
+                break
+        _uses2 = any(
+            isinstance(_x2, _ast2.Name) and _x2.id == "_SPLIT_LIMIT"
+            for _x2 in _ast2.walk(_fn2)) if _fn2 is not None else False
+        if not _uses2:
+            _bad2 += 1
+            print("  ❌ `_split_wall_lines` 没引用 `_SPLIT_LIMIT` —— "
+                  "函数体里另写数字会让调阈值静默失效")
+        # ③ 真实生产正文行为（2026-11-20 09:35 那条的盘面段，129 字）
+        _wall2 = (
+            "**盘面** 六大指数全部下跌：上证 3528.07（-1.38%，涨66跌2262）、"
+            "科创50 -2.33%、沪深300 -1.52%、创业板指 -2.15%、"
+            "恒生指数 22515.86（-1.43%）、恒生科技 -3.28%。"
+            "上证至此刻成交 484 亿，为上日全天的 11%；"
+            "主力净流出 17.61 亿（占 -3.6%），属全面下跌，并非只有权重股拖累。")
+        _rw2 = [x for x in _AN2._split_wall_lines(_wall2).split("\n")
+                if x.strip()]
+        if len(_rw2) < 2:
+            _bad2 += 1
+            print(f"  ❌ 129 字的盘面段没被拆开（实得 {len(_rw2)} 行）—— "
+                  f"手机上一折就是 8 行且续行无缩进")
+        _mx2 = max((len(x.strip()) for x in _rw2), default=0)
+        if _mx2 > (_AN2._SPLIT_LIMIT if isinstance(
+                getattr(_AN2, "_SPLIT_LIMIT", None), int) else 110):
+            _bad2 += 1
+            print(f"  ❌ 拆完仍有 {_mx2} 字的行 —— 超过阈值说明拆行没生效")
+        if _re2.sub(r"\s", "", "\n".join(_rw2)) != _re2.sub(r"\s", "", _wall2):
+            _bad2 += 1
+            print("  ❌ 拆行丢了内容 —— 读者会看到半句话")
+        if _AN2._split_wall_lines("\n".join(_rw2)) != "\n".join(_rw2):
+            _bad2 += 1
+            print("  ❌ 拆行不幂等 —— 重复调用会继续切碎")
+        if _bad2:
+            print(f"  ❌ {_bad2} 项拆行判据不成立")
+            ok_all = False
+        else:
+            print(f"  ✅ 阈值 {_AN2._SPLIT_LIMIT} 字（≈4 行屏宽）、函数取常量、"
+                  f"129 字段拆成 {len(_rw2)} 行且内容无损、幂等")
+    except Exception as e:
+        _unverified[0] += 1
+        print(f"  ❌ {e}"); ok_all = False
+
     # 14f) 静态未绑定调用 —— 调用了一个**既未定义也未导入**的名字。
     #
     # ⚠️ 为什么必须有这一项：这类错误在运行期表现为 NameError，而它几乎总是
@@ -14559,7 +14649,8 @@ def _main(ok_all):
                     #
                     # ⚠️⚠️ 必须要求**顶格**（`x == x.lstrip()`）。2026-11-19：
                     # `produce_text` 末尾新增了 `_split_wall_lines` —— 把超过
-                    # 132 字的正文段按「；」「、」拆成多行，**续行缩进两格**，
+                    # 阈值（2026-11-20 起 88 字，原 132）的正文段按
+                    # 「；」「、」拆成多行，**续行缩进两格**，
                     # 用来向读者表示"这是同一段的延续"。
                     # 于是隔夜外盘 / 美债 / 关键位那些段被拆后，续行同样含
                     # 「%」、同样不以 `**` `>` `【` 开头 —— 原判据把它们全

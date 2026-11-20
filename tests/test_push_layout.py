@@ -28,6 +28,7 @@ prompt 的排版规则写得极细（规则⑤「必须拆成 2~4 个短段，�
 - 两个函数都是纯函数、对非 str 原样返回
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -62,8 +63,12 @@ try:
     _rows = [x for x in _r.split("\n") if x.strip()]
     check(len(_rows) > 1,
           f"289 字的段必须被拆开，实得 {len(_rows)} 行")
-    check(max(len(x.strip()) for x in _rows) <= 140,
-          f"拆完每行应 ≤140 字，实得最大 {max(len(x.strip()) for x in _rows)}")
+    # 2026-11-20 阈值 132→88（用户选定「4 行」）：拆完每行必须 ≤88。
+    # ⚠️ 断言用的是**生产常量** `A._SPLIT_LIMIT`，不是抄 88 ——
+    # 阈值再调时这里自动跟上，不会出现「测试锁死旧值」。
+    check(max(len(x.strip()) for x in _rows) <= A._SPLIT_LIMIT,
+          f"拆完每行应 ≤{A._SPLIT_LIMIT} 字，"
+          f"实得最大 {max(len(x.strip()) for x in _rows)}")
     # 内容无损：去掉续行缩进与空格后拼回，必须等于原文（去空格后）
     _joined = _rows[0] + "".join(x.strip() for x in _rows[1:])
     check(_joined.replace(" ", "") == _wall.replace(" ", ""),
@@ -73,6 +78,31 @@ try:
           f"续行必须缩进两格，实得 {[_rows[1][:6]]}")
     # 幂等
     check(A._split_wall_lines(_r) == _r, "拆行必须幂等")
+
+    # ---------- ①a-2 真实生产消息：129 字那段必须被拆 ----------
+    # ⚠️⚠️ 2026-11-20 用户反馈「优化一下排版」。根因不是"没拆行"，
+    # 而是阈值取宽了：盘面段 129 字，距旧阈值 132 只差 3 字 → 不触发，
+    # 手机上一折 8 行、续行无缩进。本项用**真实生产正文**锁住该形状。
+    _real = (
+        "**盘面** 六大指数全部下跌：上证 3528.07（-1.38%，涨66跌2262）、"
+        "科创50 -2.33%、沪深300 -1.52%、创业板指 -2.15%、"
+        "恒生指数 22515.86（-1.43%）、恒生科技 -3.28%。"
+        "上证至此刻成交 484 亿，为上日全天的 11%；"
+        "主力净流出 17.61 亿（占 -3.6%），属全面下跌，并非只有权重股拖累。")
+    _rr = A._split_wall_lines(_real)
+    _rrows = [x for x in _rr.split("\n") if x.strip()]
+    check(len(_rrows) >= 2,
+          f"129 字的盘面段必须被拆（旧阈值 132 只差 3 字就不拆），"
+          f"实得 {len(_rrows)} 行")
+    check(all(len(x.strip()) <= A._SPLIT_LIMIT for x in _rrows),
+          f"拆完每行必须 ≤{A._SPLIT_LIMIT}，"
+          f"实得 {[len(x.strip()) for x in _rrows]}")
+    check(re.sub(r"\s", "", _rr) == re.sub(r"\s", "", _real),
+          "拆真实生产段不得丢内容")
+    # 阈值必须是「4 行屏宽」这个量级，不是被谁偷偷调回 132
+    check(A._SPLIT_LIMIT <= 110,
+          f"_SPLIT_LIMIT={A._SPLIT_LIMIT} 太宽：22 字/行下超过 5 行就是一堵墙"
+          f"（规则⑤要求 2~4 个短段）")
 
     # ---------- ①b 无顿号边界时不得把段头甩成空行 ----------
     # ⚠️ `[实测]` 第一版拆行只找「、」，遇到"整句只有逗号"的段（盘面常见）
