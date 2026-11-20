@@ -11896,6 +11896,99 @@ def _main(ok_all):
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
 
+    # 14e-3b) 取数全局上限 —— data_cap 必须真的钳、必须留痕、必须被接上。
+    #
+    # ⚠️⚠️ 这一段是**补漏**写的，记下为什么：`data_cap` 的 4 条变异锚点
+    # （data-budget-*，2026-11-20 早先那次修复时加的）**从来没有判据**——
+    # 自检里当时连「取数全局上限」这几个字都没有，判据只写在
+    # `tests/test_data_budget.py`。而变异测试跑的是**自检**，于是今天补跑
+    # 得到「抓住 0 / 漏网 4」：四条注入（无视剩余 / 量比未接 / 不设截止 /
+    # 钳制不留痕）全部照常 rc=0。
+    # 这正是本仓库反复的那类缺陷：**判据只在 tests/、变异体在 selfcheck
+    # 里裸奔**。功能在、锚点在、证据全无。
+    #
+    # 判据用**行为**而不是源码形状（形状判据挡不住 `if False and ...`）：
+    #   · 设 30s 剩余、源自报 60s → data_cap 必须返回 ≈30（不能返回 60）
+    #   · 未设截止 → 必须原样返回（不能误伤 collect/webui 那些无截止场景）
+    #   · 钳到了必须记 1 条日志；同一 what 一轮内只记 1 条（留痕但别刷屏）
+    print("\n[取数全局上限]")
+    try:
+        import marketlib as _M5
+        _bad5 = 0
+        _logs5 = []
+        _save_log5 = _M5.log
+        _M5.log = lambda m, lv=None: _logs5.append(str(m))
+        try:
+            # ① 剩余 30s、源要 60s → 必须钳到 ~30
+            _M5.set_data_deadline(time.time() + 30)
+            _cap5 = _M5.data_cap(60, "自检-钳制")
+            if not (isinstance(_cap5, (int, float)) and 25 <= _cap5 <= 31):
+                _bad5 += 1
+                print(f"  ❌ 剩余 30s 时 data_cap(60) 返回 {_cap5!r} —— "
+                      f"应为 ~30（全局 30s 更紧时应取 30，不是源的 60）")
+            # ② 剩余 30s、源要 10s → 取较小的 10（不得反而放大）
+            _cap5b = _M5.data_cap(10, "自检-较小")
+            if not (isinstance(_cap5b, (int, float)) and 9 <= _cap5b <= 11):
+                _bad5 += 1
+                print(f"  ❌ 源预算更小时 data_cap(10) 返回 {_cap5b!r} —— "
+                      f"不得放大到全局剩余")
+            # ③ 未设截止 → 原样返回（不得误伤无截止场景）
+            _M5.set_data_deadline(None)
+            _cap5c = _M5.data_cap(60, "自检-无截止")
+            if _cap5c != 60:
+                _bad5 += 1
+                print(f"  ❌ 未设截止时 data_cap(60) 返回 {_cap5c!r} —— "
+                      f"必须原样返回，否则 collect/webui 等无截止场景被误伤")
+            # ④ 钳到了必须留痕，且同一 what 一轮只记一条
+            _logs5.clear()
+            _M5.set_data_deadline(time.time() + 20)
+            _M5.data_cap(60, "自检-留痕")
+            _M5.data_cap(60, "自检-留痕")
+            _cap_logs = [x for x in _logs5 if "上限生效" in x]
+            if len(_cap_logs) != 1:
+                _bad5 += 1
+                print(f"  ❌ 钳制日志应恰好 1 条（同 what 一轮内去重），"
+                      f"实得 {len(_cap_logs)} 条 —— 不记日志则降级无声，"
+                      f"推送里看不出该源本轮取不全")
+        finally:
+            _M5.log = _save_log5
+            _M5.set_data_deadline(None)
+        # ⑤ 接线：hot.py 的 members 与量比两处都必须过 data_cap
+        _hot5 = open(os.path.join(MAIN_ROOT, "hot.py"), encoding="utf-8").read()
+        _n5 = _hot5.count("M.data_cap(")
+        if _n5 < 2:
+            _bad5 += 1
+            print(f"  ❌ hot.py 只有 {_n5} 处 data_cap —— members 与量比都该被"
+                  f"全局上限钳；漏一处它就能独自吃满 80s，AI 上限被挤掉")
+        # ⑥ run() 必须按本轮起点设截止（设成 None 等于整个修复没接上）
+        _an5 = open(os.path.join(MAIN_ROOT, "analyze.py"), encoding="utf-8").read()
+        if "set_data_deadline(" not in _an5:
+            _bad5 += 1
+            print("  ❌ analyze.py 没有 set_data_deadline( —— 全局上限永不生效")
+        else:
+            _t5 = _ast3.parse(_an5)
+            _ok5 = False
+            for _n in _ast3.walk(_t5):
+                if (isinstance(_n, _ast3.Call)
+                        and getattr(_n.func, "attr", "") == "set_data_deadline"
+                        and _n.args):
+                    _code5 = _ast3.unparse(_n)
+                    if "DATA_BUDGET" in _code5 and "_t0" in _code5:
+                        _ok5 = True
+            if not _ok5:
+                _bad5 += 1
+                print("  ❌ set_data_deadline 必须以 `_t0 + DATA_BUDGET` 调用 —— "
+                      "否则截止点与轮次起点脱钩，上限形同虚设")
+        if _bad5:
+            print(f"  ❌ {_bad5} 项取数全局上限判据不成立")
+            ok_all = False
+        else:
+            print("  ✅ data_cap 真钳到剩余、无截止不误伤、留痕去重、"
+                  "hot 两处已接、run 按本轮起点设截止")
+    except Exception as e:
+        _unverified[0] += 1
+        print(f"  ❌ {e}"); ok_all = False
+
     # 14e-4) 占位行剔除不得留下「孤儿段头」（2026-11-20 实推缺陷）。
     #
     # 生产 5 条推送里出现过光秃秃的 `**热点**` 段头、下面空无一字
