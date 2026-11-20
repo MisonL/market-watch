@@ -4631,6 +4631,25 @@ MUTANTS = [
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
 
+    # --- AI 调用留痕（2026-11-21，P1 可观测性）---
+    # `AI_MODEL=None` 走 CLI 默认模型，那个 id 只在上游，日志里从来没记过。
+    # 11-20 排查 AI 变慢时只能手工跑 CLI 才知道是 claude-fable-5。
+    ("ai-observability-log-removed",
+     "analyze.py",
+     '        M.log(f"AI 调用：模型 {_mdl or (model or M.AI_MODEL or \'CLI 默认\')} "\n              f"· 耗时 {_dt_ai:.0f}s · 原始 {_nch} 字符 · rc={_rc} "\n              f"· 预算 {(_budget if _budget is not None else -1):.0f}s"\n              f"{\'（被掐停）\' if _to else \'\'}"\n              # ⚠️ `dry` **不是**本函数的可见名（它是 main() 的局部量）——\n              # 第一版直接写了 `if dry`，NameError 被 `_invoke` 外层那句\n              # `except Exception: pass` **静默吞掉**，日志一条都不出，\n              # 而我以为是"没走到这里"。用模块级判定函数 `_dry_flag_active()`\n              # 才是对的（同名函数本就在，见 768 行）。\n              f"{\'（dry）\' if _dry_flag_active() else \'\'}", "AI")',
+     "        pass  # 注入：删掉 AI 留痕",
+     "[AI 调用留痕] 留痕日志被删 → 「今天用哪个模型」又变成查不到，"
+     "「变慢了」分不清是换模型还是同模型变慢",
+     "没有「AI 调用：模型」日志"),
+
+    ("ai-observability-model-blind",
+     "marketlib.py",
+     '        if _o.get("type") == "system" and _o.get("model"):',
+     '        if False and _o.get("type") == "system" and _o.get("model"):',
+     "[AI 调用留痕] 模型抽取恒空 → 日志只会打「CLI 默认」，"
+     "上游真实模型名仍然不可见（记录了半天等于没记）",
+     "ai_extract_model(init 事件)"),
+
     # --- 取数入口零发包（2026-11-21，P1）---
     # `data_cap` 只管 clist/members/量比；quotes（行情/港股/备用源）原先
     # 完全不受约束 —— 11:42 那轮 143s 就花在这，AI 拿到 0s 预算。

@@ -966,6 +966,36 @@ def ai_tools_args() -> list[str]:
     return ["--tools", ""]
 
 
+def ai_extract_model(raw: str) -> str:
+    """从 stream-json 的 `system/init` 事件里取**实际生效的模型 id**。
+
+    ⚠️⚠️ 为什么需要它（2026-11-21，P1 可观测性）：`AI_MODEL = None` 时
+    走 CLI 的**默认模型**，那个 id 只存在于上游、我方代码里根本没有 ——
+    于是"今天用的是哪个模型"这个问题，日志里**从来查不到**。
+    `[实测]` 11-20 排查 AI 变慢时，我只能靠 `claude` CLI 手工实测才知道
+    是 `claude-fable-5`；日志里一个字都没有。换模型/定位是"模型变了"
+    还是"同一模型变慢"这类判断，全都做不了。
+
+    init 事件是流里**第一个**事件，因此即便调用被看门狗中途掐停、
+    `assistant` 正文块还没出来，模型名也拿得到 —— 这正是部分输出场景
+    最需要记录的场合。
+
+    取不到就返回空串（text 模式 / 解析失败），由调用方降级成 `AI_MODEL`。
+    """
+    import json as _j
+    for _line in (raw or "").splitlines():
+        _line = _line.strip()
+        if not _line.startswith("{"):
+            continue
+        try:
+            _o = _j.loads(_line)
+        except Exception:
+            continue
+        if _o.get("type") == "system" and _o.get("model"):
+            return str(_o["model"])[:60]
+    return ""
+
+
 def ai_extract_text(raw: str) -> str:
     """从 claude CLI stdout 取出**正文**文本。
 

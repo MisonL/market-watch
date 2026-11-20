@@ -12181,6 +12181,59 @@ def _main(ok_all):
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
 
+    # 14e-5) AI 调用必须留痕（模型名/耗时/输出量）—— 2026-11-21。
+    #
+    # `AI_MODEL = None` 时走 CLI 的**默认模型**，那个 id 只存在于上游：
+    # 于是"今天用哪个模型"日志里从来查不到。`[实测]` 11-20 排查 AI 变慢
+    # （兜底率 0%→23%）时只能手工跑 CLI 才知道是 `claude-fable-5`；
+    # 没有这条，"变慢了"到底是「换了模型」还是「同一模型变慢」分不开。
+    #
+    # ⚠️ 这段还有个曾经的**假绿**教训：第一版写 `if dry:`，而 `dry` 不是
+    # `_invoke` 的可见名 → NameError 被该函数外层 `except Exception: pass`
+    # **静默吞掉** → 日志一条不出，还查不出原因。所以判据必须验
+    # "日志真的产生"，而不是"源码里有这行 f-string"。
+    print("\n[AI 调用留痕]")
+    try:
+        import marketlib as _M6
+        _bad6 = 0
+        _init6 = ('{"type":"system","subtype":"init",'
+                  '"model":"claude-fable-5"}')
+        # ① 模型抽取四态
+        for _raw6, _want6, _why6 in (
+                (_init6, "claude-fable-5", "init 事件"),
+                ("", "", "空输入"),
+                ("not json", "", "非 JSON"),
+                ('{"type":"system"}', "", "无 model 字段")):
+            _got6 = _M6.ai_extract_model(_raw6)
+            if _got6 != _want6:
+                _bad6 += 1
+                print(f"  ❌ ai_extract_model({_why6}) = {_got6!r}，"
+                      f"应为 {_want6!r}")
+        # ② 日志必须真的打出（直接看源码里的调用点 + 关键字段）
+        _an6 = open(os.path.join(MAIN_ROOT, "analyze.py"),
+                    encoding="utf-8").read()
+        if "AI 调用：模型" not in _an6:
+            _bad6 += 1
+            print("  ❌ analyze.py 没有「AI 调用：模型」日志 —— "
+                  "模型名又变成日志查不到")
+        elif "ai_extract_model" not in _an6:
+            _bad6 += 1
+            print("  ❌ 日志没走 ai_extract_model —— 打出来的只会是"
+                  "「CLI 默认」，等于没记录真实模型")
+        # ③ 掐停标记：被闸门掐停的轮次最需要看清模型
+        if "掐停" not in _an6:
+            _bad6 += 1
+            print("  ❌ 留痕没标「掐停」—— 部分输出的轮次分不清是"
+                  "「模型慢」还是「被我们掐了」")
+        if _bad6:
+            print(f"  ❌ {_bad6} 项 AI 留痕判据不成立")
+            ok_all = False
+        else:
+            print("  ✅ 模型抽取四态正确、日志走真实模型名、掐停有标记")
+    except Exception as e:
+        _unverified[0] += 1
+        print(f"  ❌ {e}"); ok_all = False
+
     # 14f) 静态未绑定调用 —— 调用了一个**既未定义也未导入**的名字。
     #
     # ⚠️ 为什么必须有这一项：这类错误在运行期表现为 NameError，而它几乎总是

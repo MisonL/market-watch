@@ -4648,6 +4648,27 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
         # 正文要经 `M.ai_extract_text` 抽出来；text 模式原样返回（只剥 CLI
         # 自报标记行）。**必须在下面三层剥离之前**做 —— 剥离链按"已是正文"
         # 的前提工作，拿 JSONL 喂它只会把事件流当正文。
+        # ⚠️⚠️ 2026-11-21（P1 可观测性）：把**实际生效的模型名**记下来。
+        # `AI_MODEL = None` 时走 CLI 默认模型，那个 id 只存在于上游 ——
+        # `[实测]` 11-20 排查"AI 一天慢到 104s"时，日志里**一个字都没有**，
+        # 我只能手工跑 `claude` CLI 才知道是 `claude-fable-5`。
+        # 没有这条记录，"它变慢了"到底是"换了模型"还是"同一模型变慢"
+        # 根本分不开 —— 而这两种处置完全不同（换回来 vs 查网关）。
+        # 取模型名必须在**抽取之前**（抽取会丢事件流），且 init 是流里
+        # 第一个事件，所以被闸门掐停、正文还没出来时也拿得到。
+        _mdl = M.ai_extract_model(_so or "")
+        _dt_ai = time.monotonic() - _t
+        _nch = len((_so or ""))
+        M.log(f"AI 调用：模型 {_mdl or (model or M.AI_MODEL or 'CLI 默认')} "
+              f"· 耗时 {_dt_ai:.0f}s · 原始 {_nch} 字符 · rc={_rc} "
+              f"· 预算 {(_budget if _budget is not None else -1):.0f}s"
+              f"{'（被掐停）' if _to else ''}"
+              # ⚠️ `dry` **不是**本函数的可见名（它是 main() 的局部量）——
+              # 第一版直接写了 `if dry`，NameError 被 `_invoke` 外层那句
+              # `except Exception: pass` **静默吞掉**，日志一条都不出，
+              # 而我以为是"没走到这里"。用模块级判定函数 `_dry_flag_active()`
+              # 才是对的（同名函数本就在，见 768 行）。
+              f"{'（dry）' if _dry_flag_active() else ''}", "AI")
         _so = M.ai_extract_text(_so or "")
         # ⚠️ 三层剥离，顺序有讲究：
         #   ① `_strip_fence` 先去掉 ``` 围栏（否则围栏行会被下面当成正文）
