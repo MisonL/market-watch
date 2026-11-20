@@ -853,6 +853,12 @@ _ROUND_AI_FALLBACK: list[bool] = []
 # 存在的理由见 runlog 里 `struct_partial` 的注释：回退是刻意的取舍，
 # 但「多少条推送带结构缺陷」应该可统计。
 _ROUND_STRUCT_PARTIAL: list[bool] = []
+# ⚠️ 2026-11-20（P1）：本轮 AI 若被终止，**被谁终止**（见 `_stall_kind`）。
+# 与上面两个同型的单元素标志位，`run()` 收尾写进 runlog 的 `ai_stall`。
+# 存在的理由：`ai_fallback` 只说"退了模板"，不说"为什么"—— 而
+# 「我方预算掐的」与「通道挂了」的处置方向相反（调预算 vs 查网关）。
+# 落盘后 `_ai_fallback_verdict` 才能区分二者，不再把抠预算报成通道故障。
+_ROUND_AI_STALL: list[str] = []
 # ⚠ 2026-11-11（Codex 审查，P2）：本轮推送是否「投递结果未知」。
 # curl 超时时服务端**可能已收到**（实测：拖响应服务器 + `--max-time` 超时，
 # 服务端确实收到了请求）。若按「未发出」回滚去重键，下一轮会重推同一条。
@@ -3599,6 +3605,83 @@ def _strip_meta(t):
 _PREAMBLE_PUNCT = " \t　.,;:。，、·…"
 
 
+def _stall_kind(se, timed_out=False):
+    """AI 调用被终止的**类型标记**（纯函数，供 runlog 落盘与自检归因）。
+
+    ## 为什么需要它（2026-11-20，P1）
+
+    `_stall_desc` 产出的是**给人读的中文长句**，只进 watch.log。而
+    `runs.jsonl` 只落 `ai_fallback=True/False` —— 于是「本轮为什么退模板」
+    这件事在流水里**完全丢失**。
+
+    `[实测]` 2026-11-19 自检因此给出**错误诊断**：当日 5 轮兜底里
+    **4 轮是我方单轮预算掐的**（`watch.log` 自己都写着「是我方预算上限，
+    不是通道故障」），只有 1 轮是通道挂起。但流水里两者都是
+    `ai_fallback=True`，`_ai_fallback_verdict` 只能合并成
+    「AI 通道实质不可用 —— 查 `docker logs new-api` 的 stream disconnected」。
+    我照着这条提示去查网关，方向一开始就是错的。
+
+    ## 判据来源
+
+    **照抄** `_stall_desc` 用的 stderr 标记，不新增猜测。两个函数必须
+    同步读取同一组 marker —— 注释里写明这一点，是因为本仓库反复出现
+    「同一口径两处维护、改一处漏一处」的缺陷（`sector_rows` 那次就是）。
+
+    返回值（短 token，进 JSON 不浪费体积）：
+      · `"budget"`        总时长闸门 —— **我方**预算上限，通道是好的
+      · `"budget-skip"`   预算在调用**之前**就已耗尽，本次压根没发起
+      · `"first-byte"`    首字节闸门（零输出）
+      · `"model-reject"`  模型名被网关拒后仍无产出
+      · `"text-gate"`     纯思考流、从不吐正文
+      · `"idle"`          空闲闸门（产出中途停了）
+      · `"is-error"`      返回了错误正文
+      · `"launch"`        本地启动失败（Popen：二进制度/参数长度/权限）
+      · `"exception"`     调用体抛异常
+      · `"exit"`          rc≠0 / rc=0 但正文空，且无上述标记
+      · `None`            没被终止（正常完成）
+
+    ⚠️ `"budget"` / `"budget-skip"` / `"launch"` / `"is-error"` /
+    `"text-gate"` 都是**我方或模型侧**问题（通道是通的），只有
+    `"first-byte"` / `"idle"` / `"model-reject"` 指向通道/配置。
+    这个划分是 `_ai_fallback_verdict` 归因的依据，别随手合并。
+    """
+    _s = se or ""
+    # 顺序有讲究：`first-byte-gate-after-model-reject` 必须排在
+    # `first-byte-gate` 之前（前者是后者的子串变体），与 `_stall_desc` 同序。
+    if "[first-byte-gate-after-model-reject " in _s:
+        return "model-reject"
+    if "[first-byte-gate " in _s:
+        return "first-byte"
+    if "[text-gate " in _s:
+        return "text-gate"
+    if "[total-limit-gate " in _s:
+        return "budget"
+    # ⚠️ `budget-exhausted` 是**调用前**就跳过（取数吃光了全轮预算），
+    # 与上一支「发起过但没跑完」是两件事：前者连一次 AI 都没调，
+    # 说明预算得从取数阶段去省，而不是去查模型慢。
+    if "[budget-exhausted " in _s:
+        return "budget-skip"
+    # 本地启动失败：Popen 的 E2BIG/ENOENT/EACCES/Exec format —— 全是本机
+    # 问题，重试与熔断都不会自愈，排查方向与通道故障相反。
+    if _s.startswith("Popen 失败"):
+        return "launch"
+    if timed_out:
+        return "idle"
+    return "exit"
+
+
+def _stall_record(se, timed_out=False, kind=None):
+    """把本轮**第一次** AI 终止原因记进 `_ROUND_AI_STALL`（首记优先）。
+
+    为什么首记优先：一轮里 `ai_analyze` 可能被调 2~3 次（禁用词重写 /
+    结构重写）。读者看到的模板是**第一次失败**导致的 —— 后面那次是在
+    残缺情境内重试，它失败是果不是因。记后面的会把归因带偏。
+    """
+    if _ROUND_AI_STALL:
+        return
+    _ROUND_AI_STALL.append(kind or _stall_kind(se, timed_out))
+
+
 def _stall_desc(se, timed_out, rc):
     """AI 调用被终止的原因文案（纯函数，供 ai_analyze 与自检共用）。
 
@@ -4664,6 +4747,7 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
         # 不区分的话下面 `if out: M.ai_fail_clear()` 会把熔断清掉 ——
         # 上游持续故障时熔断永远不触发，每轮照烧两次 AI 调用。
         if out and M.ai_is_error_text(out):
+            _stall_record(_se, _to, "is-error")
             _log(f"AI 返回错误正文（is_error）：{out[:160]}")
             M.ai_fail_set(time.time() + M.AI_COOLDOWN)
             _log(f"{_single_fail_verdict(_se)} —— AI 通道熔断 "
@@ -4686,6 +4770,7 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
             # （`_safe()` 闸门 + 长度下限由调用方 produce_text 负责）。
             # 能用就用，不能用才退回模板 —— 比直接扔掉 15 分钟的成果好。
             if out:
+                _stall_record(_se, _to)
                 _log(f"AI 终止（{_stall_desc(_se, _to, _rc)}）"
                      f"，耗时 {_d:.0f}s —— 保留已产出的 {len(out)} 字符"
                      f"作为部分结果")
@@ -4717,6 +4802,7 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
             # （stderr 来源标记），不猜时长：stderr 带 `[total-limit-gate`
             # 就是"我方主动掐停"，只记日志、不写熔断、也不清熔断（通道健康
             # 与否本轮无从判断，留给下一轮的正常路径去证明）。
+            _stall_record(_se, _to)
             _log(f"AI 终止（{_stall_desc(_se, _to, _rc)}）"
                  f"，耗时 {_d:.0f}s，且无任何产出")
             if "[total-limit-gate " in (_se or ""):
@@ -4774,6 +4860,10 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
             # 熔断，一次正常的慢轮就会让后续 10 分钟全退模板，把"省下的
             # 时间"又赔回去。判据用 `_invoke` 在预算耗尽时留的专用标记。
             if "[budget-exhausted " in (_se or ""):
+                # 预算在**调用之前**就耗尽了（取数吃光了全轮预算）。
+                # 与「调用跑到一半被掐」（budget）分开记：前者是
+                # **连一次 AI 都没发起**，后者是发起过没跑完。
+                _stall_record(_se, _to, "budget-skip")
                 return ""
             # ⚠️ **本地启动失败不是通道故障**（2026-10-28 修，P2）。
             # `Popen` 抛的是 E2BIG（prompt 超单参数上限）/ENOENT（二进制
@@ -4829,10 +4919,15 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
                     except Exception:
                         _launch_retried[0] = False
                         raise
+                _stall_record(_se, _to, "launch")
                 _log(f"AI 本地启动失败（{_se[:160]}）—— 不是通道故障，"
                      f"不写熔断；查 claude 二进制权限/参数长度/磁盘空间", "ERR")
                 return ""
             _killed = f"（{_stall_desc(_se, _to, _rc)}）" if _to else ""
+            # ⚠️ 这条分支**会写熔断**，所以必须区分"空输出"与"通道挂起"：
+            # rc=0 且 stderr 干净的空输出，`_stall_kind` 落到 "exit" ——
+            # 排查方向是"CLI 跑完但没给正文"，不是"网关断流"。
+            _stall_record(_se, _to)
             _log(f"AI 空输出 rc={_rc}{_killed} stderr={_se[:200]}")
             # 空输出 = 通道不可用 → 熔断。与上面卡死路径同款：这两条分支
             # 覆盖了"零产出"的全部形态（前端卡死 vs 跑完但返回空），
@@ -4845,6 +4940,7 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
         # 异常（Popen 失败等）。⚠️ 备用链已取消（2026-10-22）—— 异常就是
         # 本轮失败，直接退回模板。原先这里会再走一次备用调用，把一次
         # Popen 失败放大成两次子进程尝试 + 一次熔断判定。
+        _stall_record("", False, "exception")
         _log(f"AI 异常 {e}")
         return ""
 
@@ -4986,6 +5082,7 @@ def main():
     _ROUND_AI_MS.clear()
     _ROUND_AI_FALLBACK.clear()
     _ROUND_STRUCT_PARTIAL.clear()
+    _ROUND_AI_STALL.clear()
     _now=datetime.datetime.now()
     _st={"status":"error"}          # 兜底：任何未预期路径都记为 error
     _rl.run("analyze","ok",phase="start")
@@ -5089,7 +5186,8 @@ def main():
                 data_ms=_ROUND_DATA_MS,
                 ai_ms=(sum(_ROUND_AI_MS) if _ROUND_AI_MS else None),
                 ai_fallback=bool(_ROUND_AI_FALLBACK),
-                struct_partial=bool(_ROUND_STRUCT_PARTIAL))
+                struct_partial=bool(_ROUND_STRUCT_PARTIAL),
+                ai_stall=(_ROUND_AI_STALL[0] if _ROUND_AI_STALL else None))
 
 # 行列式复用：把 collect 写的快照还原成 quotes() 口径的行。
 #

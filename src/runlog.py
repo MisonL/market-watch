@@ -515,7 +515,8 @@ def run(script: str, status: Status, phase: str = "end", t0=None,
         starved: int | None = None,
         data_ms: int | None = None, ai_ms: int | None = None,
         ai_fallback: bool | None = None,
-        struct_partial: bool | None = None):
+        struct_partial: bool | None = None,
+        ai_stall: str | None = None):
     # 每一轮都落一次心跳（不分 phase）—— 它只回答“这个任务最近一次真正
     # 跑起来是什么时候”。主链路**停摆**是唯一没有任何信号的故障形态
     # （见 BEAT_FILE 处的 11-08 事故）。放在这里是因为 analyze/collect 都必经过它。
@@ -610,6 +611,18 @@ def run(script: str, status: Status, phase: str = "end", t0=None,
     # 只在 True 时写（与 starved/ai_fallback 同理）：省体积，且“没这个键”就是“结构完整”。
     if struct_partial:
         rec["struct_partial"] = True
+    # `ai_stall`：本轮 AI 被终止的原因 token（2026-11-20 加，P1 归因缺口）。
+    #
+    # ⚠️ 存在的理由：`ai_fallback` 只说"退了模板"，**不说为什么**。而
+    # 「我方预算掐的」与「通道挂了」的处置方向相反 —— 前者该调预算，
+    # 后者该查网关。`[实测]` 2026-11-19 当日 5 轮兜底里 4 轮是我方预算
+    # 掐的（watch.log 自己写着「不是通道故障」），但流水里全是
+    # `ai_fallback=True`，`_ai_fallback_verdict` 只能合并成
+    # 「AI 通道实质不可用 —— 查 docker logs new-api」，把排查方向引错。
+    # token 取值与判据见 `analyze._stall_kind`（单一真值，此处不复制）。
+    # 只在非 None 时写（与 starved/ai_fallback/struct_partial 同理）。
+    if ai_stall:
+        rec["ai_stall"] = str(ai_stall)[:20]
     # `gap_s`：距**上一条流水**的秒数（2026-10-21）。
     #
     # ⚠️ 存在的理由：系统此前**无法区分**「launchd 没触发」与「触发了但

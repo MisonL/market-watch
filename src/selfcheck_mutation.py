@@ -4030,7 +4030,15 @@ MUTANTS = [
      "没传 total_limit"),
     ("ai-budget-exhausted-trips-breaker",
      "analyze.py",
-     '            if "[budget-exhausted " in (_se or ""):\n                return ""',
+     # ⚠️ 2026-11-20 锚点同步：该分支中间插入了 `_stall_record`（归因落盘）。
+     # 注入体必须**整段**替换 —— 只改 `if` 那一行的话，`_stall_record`
+     # 还照常执行，归因被记成 budget-skip，测不出"误判成通道故障"。
+     '            if "[budget-exhausted " in (_se or ""):\n'
+     '                # 预算在**调用之前**就耗尽了（取数吃光了全轮预算）。\n'
+     '                # 与「调用跑到一半被掐」（budget）分开记：前者是\n'
+     '                # **连一次 AI 都没发起**，后者是发起过没跑完。\n'
+     '                _stall_record(_se, _to, "budget-skip")\n'
+     '                return ""',
      '            if False:  # 注入：预算耗尽也走熔断\n                return ""',
      "[AI 通道] 预算耗尽被误判成通道故障 → 一次正常慢轮让后续 10 分钟"
      "全退模板，把省下的时间又赔回去",
@@ -4622,6 +4630,43 @@ MUTANTS = [
      '        _m_tl = re.search(r"\\[total-limit-gate (\\d+)s", se or "")',
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
+
+    # --- AI 终止归因落盘（2026-11-20，P1）---
+    # `ai_fallback` 只说"退了模板"，不说"为什么"。2026-11-19 自检因此把
+    # 4 轮「我方预算掐的」+1 轮「通道挂起」合并报成「AI 通道实质不可用 →
+    # 查网关」，把排查方向引错了。判据在 tests/test_ai_stall_attribution.py。
+    ("ai-stall-record-last-wins",
+     "analyze.py",
+     '    if _ROUND_AI_STALL:\n        return',
+     '    if False:  # 注入：改为后记覆盖\n        return',
+     "[AI 兜底归因] 本轮 AI 终止原因被后一次调用覆盖 → 读者看到的模板是"
+     "第一次失败导致的，归因却指向重写那次（真因被替换成结果）",
+     "必须首记优先"),
+
+    ("ai-stall-not-persisted",
+     "runlog.py",
+     '    if ai_stall:\n        rec["ai_stall"] = str(ai_stall)[:20]',
+     '    pass  # 注入：不落 ai_stall',
+     "[AI 兜底归因] ai_stall 不落流水 → 自检仍只能看到 ai_fallback=True，"
+     "把预算掐停报成通道故障（2026-11-19 实测的误诊形态）",
+     # ⚠️ 期望串取自自检 ❌ 行原文「ai_stall 未落流水（…）」，不是本注释措辞
+     "ai_stall 未落流水"),
+
+    ("ai-stall-kind-model-reject-order",
+     "analyze.py",
+     '    if "[first-byte-gate-after-model-reject " in _s:\n        return "model-reject"',
+     '    if False:  # 注入：漏掉 model-reject 分支\n        return "model-reject"',
+     "[AI 兜底归因] 模型名被拒的变体没单独判 → 归因错成「零输出」"
+     "（排查方向从'查模型配置'变成'查网关断流'）",
+     "model-reject"),
+
+    ("ai-stall-split-accepts-str",
+     "selfcheck.py",
+     '    if isinstance(stalls, (str, bytes)) or stalls is None:\n        return 0, 0',
+     '    if stalls is None:\n        return 0, 0',
+     "[AI 兜底归因] 拿去分类的 stalls 传入字符串时被逐字符计数 → "
+     "7 个字符各算一次兜底，'预算为主'的判定被脏输入带偏",
+     "0, 0"),
 
     # ③ load_st 把「读不动」折叠成「不存在」（P1）：坏 JSON/EACCES 时
     # 静默返回空状态，当天 fired 去重记录清零 → 剩余时段重复推送，

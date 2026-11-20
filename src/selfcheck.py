@@ -502,7 +502,7 @@ def _this_year12():
     return str(datetime.datetime.now().year)
 
 
-def _ai_fallback_verdict(n_fb, n_ai):
+def _ai_fallback_verdict(n_fb, n_ai, stalls=None):
     """当日兜底轮数 / 真调 AI 轮数 → ok / warn / fail？
 
     `ok`   = 无兜底（或既没兜底也没真调，如当天还没到推送点）；
@@ -523,6 +523,25 @@ def _ai_fallback_verdict(n_fb, n_ai):
     ⚠️ 脏输入一律 `ok`：None / 非整数 —— 判不了就不报，宁可漏判也不误报
     （同 `_error_streak_verdict` 的口径）。负分母按 0 处理。
     兜底数 > 分母（数据不一致）时按 fail 处理，但**不抛异常**（除零/负数）。
+
+    ## `stalls`（2026-11-20 加）：区分「我方掐的」与「通道挂了」
+
+    上面那条 `fail` 的**措辞**原先一律是「AI 通道实质不可用 → 查网关」。
+    `[实测]` 2026-11-19 因此把人引错了方向：当日 5 轮兜底里 **4 轮是我方
+    单轮预算掐的**（`watch.log` 自己写着「是我方预算上限，不是通道故障」），
+    只有 1 轮是通道挂起。而 runlog 里两者都是 `ai_fallback=True`。
+
+    现在 `analyze._stall_kind` 把原因落进 runlog 的 `ai_stall`，本函数按它
+    分成两个**判定相同、措辞相反**的 fail：
+
+      · 预算类（`budget` / `budget-skip`）占兜底轮**过半** →
+        fail，但说明是「我方预算，处置是调预算/省取数」，不是查网关
+      · 其余（通道/模型/本地启动）→ fail，保持原来的查网关措辞
+
+    判定（ok/warn/fail）**不因 stalls 改变** —— 只改措辞。理由：读者拿到的
+    都是模板文案，「是否算故障」这件事与谁掐的无关；但「该往哪查」不同。
+    这也是为什么它是个可选参数：脏输入/老流水没有 `ai_stall` 时，
+    行为与 2026-11-19 之前**逐字一致**。
     """
     try:
         _fb = int(n_fb or 0)
@@ -540,6 +559,43 @@ def _ai_fallback_verdict(n_fb, n_ai):
     if _fb >= _ai:
         return "fail"
     return "fail" if (_fb / _ai) >= _AI_FB_ALERT_RATIO else "warn"
+
+
+# 「我方预算掐的」这一类 stall token（见 `analyze._stall_kind`）。
+# ⚠️ 与 `analyze._stall_kind` 的返回值必须同步 —— 但这里**只**列分类，
+# 不复制判据（判据仍在 analyze 一处）。加新 token 时改这里一处即可。
+_AI_STALL_BUDGET = ("budget", "budget-skip")
+
+
+def _ai_stall_split(stalls):
+    """把兜底轮的 `ai_stall` token 计数分成 (我方预算数, 其他数)。
+
+    `stalls` 可以是 dict（token→计数）或可迭代的 token 序列；脏输入返回 (0, 0)
+    —— 判不了就不报，与 `_ai_fallback_verdict` 同口径。
+    """
+    _b = _o = 0
+    # ⚠️ 字符串**必须显式拒绝**：它是 iterable，会被逐字符当成 token ——
+    # `[实测]` 传 `"garbage"` 得 (0, 7)，7 个字符各算一次兜底。
+    # 这类"看起来能迭代、语义却是脏输入"的值判不了就不报。
+    if isinstance(stalls, (str, bytes)) or stalls is None:
+        return 0, 0
+    try:
+        _it = (stalls.items() if isinstance(stalls, dict)
+               else ((x, 1) for x in stalls))
+        for _k, _n in _it:
+            try:
+                _n = int(_n or 0)
+            except (TypeError, ValueError):
+                continue
+            if _n <= 0:
+                continue
+            if _k in _AI_STALL_BUDGET:
+                _b += _n
+            else:
+                _o += _n
+    except Exception:
+        return 0, 0
+    return _b, _o
 
 
 # 当日**应推**的整点槽位 → 其「窗口关闭」时刻（距 0 点的分钟数）。
@@ -6165,6 +6221,108 @@ def _main(ok_all):
         if not _bad25:
             print("  ✅ 终止原因文案区分首字节闸门/空闲闸门/进程退出"
                   "（照抄 stderr 来源标记，不虚报秒数）")
+
+        # ---- 终止原因**落盘**（2026-11-20，P1 归因缺口）----
+        #
+        # ⚠️ 为什么这条必须在这里测，而不是只靠 tests/：
+        # `_stall_desc` 的文案进 watch.log（人能看），但 `runs.jsonl` 原先
+        # 只落 `ai_fallback=True/False` —— **日志知道、统计不知道**。
+        # `[实测]` 2026-11-19 当日 5 轮兜底里 4 轮是我方预算掐的、
+        # 只 1 轮是通道挂起，流水里却全是一个布尔值，于是自检把两者合并
+        # 报成「AI 通道实质不可用 → 查 docker logs new-api」，把人引错方向。
+        #
+        # 三件事都要钉住（任一坏掉归因就失效）：
+        #   ① `_stall_kind` 把 stderr 标记映射成 token（与 `_stall_desc` 同源）
+        #   ② `_stall_record` **首记优先**（一轮可调 2~3 次，读者看到的模板
+        #      是第一次失败导致的；记后面的会把归因换成"果"）
+        #   ③ `runlog.run(ai_stall=...)` 真的落进流水（否则自检读不到）
+        _sk_bad = 0
+        _sk_cases = [
+            ("[total-limit-gate 196.0s 触发，非 idle 闸门] ", False, "budget"),
+            ("[budget-exhausted 已耗尽] ", False, "budget-skip"),
+            ("[first-byte-gate 150s 触发] ", False, "first-byte"),
+            ("[text-gate 600s 无正文] ", False, "text-gate"),
+            ("Popen 失败: [Errno 8]", False, "launch"),
+            ("", True, "idle"),
+            ("", False, "exit"),
+            (None, False, "exit"),
+            # 顺序敏感：`first-byte-gate-after-model-reject` 是
+            # `first-byte-gate` 的**子串变体**，必须先判前者 —— 判反了
+            # 就报成「零输出」（排查方向从"查模型配置"变"查网关断流"）。
+            ("[first-byte-gate-after-model-reject 90s] ", False,
+             "model-reject"),
+        ]
+        for _sk_se, _sk_to, _sk_exp in _sk_cases:
+            try:
+                _sk_got = _A25._stall_kind(_sk_se, _sk_to)
+            except Exception as _sk_e:
+                _sk_bad += 1
+                print(f"  ❌ 终止原因分类异常：{type(_sk_e).__name__}: {_sk_e}")
+                continue
+            if _sk_got != _sk_exp:
+                _sk_bad += 1
+                print(f"  ❌ 终止原因分类 {_sk_se!r} → {_sk_got!r}，"
+                      f"期望 {_sk_exp!r}")
+
+        # ② 首记优先：第二次记录不得覆盖第一次
+        try:
+            _A25._ROUND_AI_STALL.clear()
+            _A25._stall_record("[total-limit-gate 100.0s x]", False)
+            _A25._stall_record("[first-byte-gate 150s x]", False)
+            _sk_rec = list(_A25._ROUND_AI_STALL)
+            _A25._ROUND_AI_STALL.clear()
+        except Exception as _sk_e2:
+            _sk_rec = []
+            _sk_bad += 1
+            print(f"  ❌ 终止原因记录异常：{type(_sk_e2).__name__}: {_sk_e2}")
+        if _sk_rec != ["budget"]:
+            _sk_bad += 1
+            print(f"  ❌ 终止原因必须首记优先（读者看到的模板是第一次失败"
+                  f"导致的），实得 {_sk_rec}")
+
+        # ③ 真的落进流水：写一条带 ai_stall 的流水再读回来
+        try:
+            import runlog as _RL25
+            import json as _j25
+            # ⚠⚠ **绝不能写生产 runs.jsonl**：写入的是一条
+            # `ai_fallback=True` 的 analyze 轮次，会把自检自己的兜底率
+            # 分母（当日真调 AI 轮数）算多一轮 —— 观测行为污染观测对象。
+            # 改把 `runlog.RUNS` 临时指向本项自建的探针文件，跑完还原。
+            _rl_p25 = os.path.join(DIR, "_sc_stall_probe.jsonl")
+            _rl_keep25 = _RL25.RUNS
+            _RL25.RUNS = _rl_p25
+            try:
+                _RL25.run("analyze", "push_ok", phase="end",
+                          ai_ms=1000, ai_fallback=True, ai_stall="budget")
+            finally:
+                _RL25.RUNS = _rl_keep25
+            _rl_last25 = None
+            if os.path.exists(_rl_p25):
+                with open(_rl_p25, encoding="utf-8") as _f25:
+                    for _ln25 in _f25:
+                        if _ln25.strip():
+                            _rl_last25 = _j25.loads(_ln25)
+                # ⚠️ `runlog.run` 会顺带建同名的 `.lock`（_lock 的副产物）。
+                # 只删 .jsonl 会留下 lock 残留，被后续的 [磁盘卫生] /
+                # [缓存文件形状] 抓成"探针临时文件未清理"（实测踩到）。
+                for _p25 in (_rl_p25, _rl_p25 + ".lock"):
+                    try:
+                        os.remove(_p25)
+                    except OSError:
+                        pass
+            if not _rl_last25 or _rl_last25.get("ai_stall") != "budget":
+                _sk_bad += 1
+                print(f"  ❌ ai_stall 未落流水（自检读不到掐停原因，"
+                      f"只能把预算掐停报成通道故障）: {_rl_last25}")
+        except Exception as _sk_e3:
+            _sk_bad += 1
+            print(f"  ❌ ai_stall 落盘检查异常："
+                  f"{type(_sk_e3).__name__}: {_sk_e3}")
+
+        if not _sk_bad:
+            print("  ✅ 终止原因落盘：映射/首记优先/流水字段在位"
+                  "（自检能按「我方预算」还是「通道故障」分流归因）")
+        ok_all = ok_all and _sk_bad == 0
         ok_all = ok_all and _bad25 == 0
     except Exception as e:
         _unverified[0] += 1
@@ -16217,6 +16375,10 @@ def _main(ok_all):
         _n_fb_dl = 0
         _n_ai_dl = 0
         _n_sp_dl = 0
+        # 2026-11-20：兜底轮的**掐停原因**分布（runlog 的 `ai_stall`）。
+        # 只有 2026-11-20 之后的流水才带这个键，老流水落到 "unknown" ——
+        # 不参与「我方预算」判定，仍走原来的查网关措辞（向后兼容）。
+        _stall_dl = {}
         try:
             with open(_runs_dl, encoding="utf-8", errors="replace") as _f_dl3:
                 for _l_dl3 in _f_dl3:
@@ -16238,13 +16400,18 @@ def _main(ok_all):
                         _n_ai_dl += 1
                     if _r_dl3.get("ai_fallback"):
                         _n_fb_dl += 1
+                        # ⚠️ 只统计**兜底轮**的原因：非兜底轮的 ai_stall
+                        # （例如"保留部分结果但结构仍完整"）不代表读者收到
+                        # 模板，掺进来会让分母失真。
+                        _sk_dl = _r_dl3.get("ai_stall") or "unknown"
+                        _stall_dl[_sk_dl] = _stall_dl.get(_sk_dl, 0) + 1
                     # ⚠️ 2026-11-08（复核 F8）：「回退首版但结构仍缺段」的轮次。
                     # 这不是故障（回退是刻意的取舍：缺一段的真实内容优于
                     # 机械模板），但读者确实少看到一个段。原先它只在
                     # 日志里有一行「回退首版（结构仍缺：…）」，无法统计。
                     if _r_dl3.get("struct_partial"):
                         _n_sp_dl += 1
-            _fbv_dl = _ai_fallback_verdict(_n_fb_dl, _n_ai_dl)
+            _fbv_dl = _ai_fallback_verdict(_n_fb_dl, _n_ai_dl, _stall_dl)
             if _fbv_dl == "fail":
                 if _n_ai_dl <= 0:
                     # 全兜底且一次都没真调：三者的共同点是 AI 调用**根本没发起**
@@ -16254,12 +16421,44 @@ def _main(ok_all):
                         f"缺失 / 首调预算已被取数吃光），读者全程收到模板文案。"
                         f"查 watch.log 的「熔断中」「预算已耗尽」「CLI 未找到」")
                 else:
-                    _dl_bad.append(
-                        f"当日模板兜底 **{_n_fb_dl}/{_n_ai_dl} 轮**"
-                        f"（≥ 半数）—— AI 通道实质不可用，读者拿到的多为"
-                        f"模板文案（只有盘面事实，缺隔夜/关键位/热点等判断段）。"
-                        f"查 watch.log 的「AI 终止」与 `docker logs new-api` 的"
-                        f" stream disconnected")
+                    # ⚠️ 2026-11-20（P1）：措辞必须按**掐停原因**分流。
+                    # 原先这里一律写「AI 通道实质不可用 → 查网关」，而
+                    # `[实测]` 2026-11-19 的 5 轮兜底里 4 轮是**我方单轮
+                    # 预算**掐的（watch.log 明写「不是通道故障」），只 1 轮
+                    # 是通道挂起。照原措辞去查 `docker logs new-api` 的
+                    # stream disconnected，方向从一开始就是错的 —— 这条
+                    # 提示因此把一个「预算配太紧」的问题伪装成了「网关故障」。
+                    # 判定（fail）不变，只改**往哪查**。
+                    _bq_dl, _oq_dl = _ai_stall_split(_stall_dl)
+                    _mix_dl = "、".join(
+                        f"{k}×{v}" for k, v in
+                        sorted(_stall_dl.items(), key=lambda x: -x[1])[:4])
+                    # ⚠️ 预算值的**真值**在 analyze，不在这里复制字面量
+                    # （本仓库反复的坑：同一口径两处维护）。取不到就写"?"。
+                    try:
+                        import analyze as _A_bq
+                        _rb_txt = ("不限制" if _A_bq.AI_ROUND_BUDGET is None
+                                   else f"{_A_bq.AI_ROUND_BUDGET:.0f}s")
+                    except Exception:
+                        _rb_txt = "?"
+                    if _bq_dl > 0 and _bq_dl >= _oq_dl:
+                        _dl_bad.append(
+                            f"当日模板兜底 **{_n_fb_dl}/{_n_ai_dl} 轮**"
+                            f"（≥ 半数）—— 但掐停原因以**我方单轮预算**为主"
+                            f"（{_mix_dl}）：AI 通道没坏，是"
+                            f"「全轮预算 {_rb_txt} − 取数耗时」把它压没了，"
+                            f"慢轮还没写完就被自己掐掉。读者仍只拿到模板文案。"
+                            f"处置：查该轮 `data_ms`（取数吃了多少）、"
+                            f"或调 `AI_ROUND_BUDGET`/给取数加全局上限 —— "
+                            f"**不要去查网关**")
+                    else:
+                        _dl_bad.append(
+                            f"当日模板兜底 **{_n_fb_dl}/{_n_ai_dl} 轮**"
+                            f"（≥ 半数）—— AI 通道实质不可用"
+                            f"（原因分布：{_mix_dl or '无记录'}），读者拿到的多为"
+                            f"模板文案（只有盘面事实，缺隔夜/关键位/热点等判断段）。"
+                            f"查 watch.log 的「AI 终止」与 `docker logs new-api` 的"
+                            f" stream disconnected")
             elif _fbv_dl == "warn":
                 print(f"  ℹ️  模板兜底：当日 {_n_fb_dl}/{_n_ai_dl} 轮"
                       f"（未过半，设计内噪声）")
@@ -16484,11 +16683,46 @@ def _main(ok_all):
             (5, 3, "fail"),
         ]
         for _fb, _ai, _exp in _fb_cases:
-            _got_fb = _ai_fallback_verdict(_fb, _ai)
+            # ⚠️ `stalls` 传 **unknown**（老流水形态）：这些用例锁的是
+            # 「判定」，而判定不该受掐停原因影响 —— 传 budget 会顺带
+            # 把「只改措辞、不改 ok/warn/fail」这条契约测成同义反复。
+            _got_fb = _ai_fallback_verdict(_fb, _ai, {"unknown": max(_fb or 0, 0)})
             if _got_fb != _exp:
                 _dlp_bad.append(
                     f"模板兜底率 ({_fb!r}, {_ai!r}): 得 {_got_fb!r}，"
                     f"期望 {_exp!r}")
+        # ①b-2 `_ai_stall_split`（2026-11-20 加）：把兜底轮的 ai_stall
+        # token 分成（我方预算, 其他）。它决定 [投递结果] 的措辞往哪指
+        # —— 分错就会把「预算配太紧」报成「网关故障」（11-19 实测）。
+        _spl_cases = [
+            ({"budget": 4, "first-byte": 1}, (4, 1)),
+            ({"budget": 3}, (3, 0)),
+            ({"budget-skip": 2}, (2, 0)),
+            ({"first-byte": 2, "idle": 1}, (0, 3)),
+            ({"unknown": 5}, (0, 5)),
+            (["budget", "first-byte"], (1, 1)),
+            ({}, (0, 0)),
+            (None, (0, 0)),
+            # 脏输入：字符串是 iterable，不显式拒绝会被逐字符计数
+            ("garbage", (0, 0)),
+            (b"xx", (0, 0)),
+            ({"budget": -1}, (0, 0)),
+            ({"budget": "x"}, (0, 0)),
+        ]
+        for _st, _sexp in _spl_cases:
+            _sgot = _ai_stall_split(_st)
+            if _sgot != _sexp:
+                _dlp_bad.append(
+                    f"终止原因分类 {_st!r}: 得 {_sgot!r}，期望 {_sexp!r}")
+        # ①b-3 判定**不因** stalls 改变（只改措辞）：
+        # 同一组 (兜底, 真调) 换不同 stalls 必须得到同一判定。
+        for _fb, _ai in ((5, 10), (3, 8), (1, 8), (0, 8), (4, 8)):
+            _base = _ai_fallback_verdict(_fb, _ai)
+            for _st in ({"budget": _fb}, {"first-byte": _fb}, {"unknown": _fb}):
+                if _ai_fallback_verdict(_fb, _ai, _st) != _base:
+                    _dlp_bad.append(
+                        f"stalls={_st!r} 改变了兜底率的判定（{_base!r}）"
+                        f"—— 掐停原因只该改措辞，不该改 ok/warn/fail")
         # ② 槽位投递窗口
         #    (当前时刻距 0 点分钟数, 已推送集合, 期望缺失列表)
         _sm_cases = [
@@ -16687,7 +16921,8 @@ def _main(ok_all):
                               ("_pushed_slots_from_lines", 2),
                               ("_push_kinds_today", 2),
                               ("_nowebhook_masked", 2),
-                              ("_ai_fallback_verdict", 2)):
+                              ("_ai_fallback_verdict", 2),
+                              ("_ai_stall_split", 2)):
                 _c = _dlp_calls.count(_fn)
                 if _c < _min:
                     _dlp_bad.append(
