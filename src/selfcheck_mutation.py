@@ -4671,6 +4671,16 @@ MUTANTS = [
      # 自检实际打的是「拆行阈值 132 太宽」，于是明明抓住却报漏网。
      "拆行阈值 132 太宽"),
 
+    ("push-split-head-ignores-head-width",
+     "analyze.py",
+     "        _first_left = _LIMIT - len(_head)      # 首行正文可用宽度",
+     "        _first_left = _LIMIT - 2      # 注入：首行也用续行宽",
+     "[推送排版] 首行改回按 `LIMIT-2` 切 → 带段头的首行溢出 len(head)，"
+     "2026-11-20 13:40 生产推送里 **盘面**92 / **资金**92 / **热点**91"
+     " 正是这个形态（手机上仍多折一行）",
+     # 逐字取自自检实际打出的 ❌ 行首段（只认新增失败行）
+     "带段头的首行溢出"),
+
     ("push-split-ignores-const",
      "analyze.py",
      "    _LIMIT = _SPLIT_LIMIT",

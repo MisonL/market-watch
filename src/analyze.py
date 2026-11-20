@@ -6708,15 +6708,27 @@ def _split_wall_lines(t):
         # 保留分隔符，避免把「A、B」切成「A」「B」丢信息。
         _pieces = [p for p in re.split(r"(?<=[；;])", _body) if p.strip()]
         _rows, _cur = [], _head
+        # ⚠⚠ 2026-11-20：**首行可用宽度比续行窄 `len(_head)`**。
+        #
+        # 每行上限 88，但续行前面有 2 空格缩进（`"  " + p`），
+        # 而首行前面顶着 `**段名**`（如 `**盘面** ` 占 9 字）。
+        # 原实现一律按 `_LIMIT - 2` 切，于是首行最坏能到
+        # `len(_head) + (LIMIT-2)` —— 段名越长越离谱。
+        # `[实测]` 2026-11-20 13:40 那条生产推送：仍有 3 行超 88
+        # （**盘面** 92 / **资金** 92 / **热点** 91），全是首行。
+        # 因为它们带段头，用户在手机上看到的仍是多折一行。
+        _first_left = _LIMIT - len(_head)      # 首行正文可用宽度
+        _cont_left = _LIMIT - 2               # 续行正文可用宽度
+        _left = _first_left                   # 当前这行还能放多少正文
         for _p in _pieces:
-            while len(_p) > _LIMIT - 2:
+            while len(_p) > _left:
                 # 优先在「、」「，」处断 —— 那是最自然的停顿。
                 # ⚠️ `[实测]` 第一版只找「、」，遇到"整句无顿号、只有逗号"
                 # 的段（盘面常见）就走到硬切，于是把「资金」劈成「资」+「金」。
-                _cut = max(_p.rfind("、", 0, _LIMIT - 2),
-                           _p.rfind("，", 0, _LIMIT - 2))
+                _cut = max(_p.rfind("、", 0, _left),
+                           _p.rfind("，", 0, _left))
                 if _cut <= 0:
-                    _cut = _LIMIT - 2
+                    _cut = _left
                     # 硬切：只切字，不在词中停 —— 挑一个后面不是数字的位置，
                     # 免得「20 日低」被劈开。
                     while (_cut > 10 and _p[_cut:_cut + 1].isdigit()):
@@ -6729,14 +6741,18 @@ def _split_wall_lines(t):
                 if len(_cur) + len(_p[:_cut]) > _LIMIT and _cur != _head:
                     _rows.append(_cur)
                     _cur = "  " + _p[:_cut]
+                    _left = _cont_left
                 else:
                     _cur += _p[:_cut]
                 _p = _p[_cut:]
             if len(_cur) + len(_p) > _LIMIT and _cur != _head:
                 _rows.append(_cur)
                 _cur = "  " + _p
+                _left = _cont_left
             else:
                 _cur += _p
+            # 本行还富余多少（首行扣掉段头，续行扣掉 2 空格缩进）
+            _left = (_LIMIT - len(_cur)) if _cur.startswith("  ") else _first_left - (len(_cur) - len(_head))
         if _cur.strip():
             _rows.append(_cur)
         if len(_rows) > 1:

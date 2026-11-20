@@ -11771,6 +11771,24 @@ def _main(ok_all):
         if _AN2._split_wall_lines("\n".join(_rw2)) != "\n".join(_rw2):
             _bad2 += 1
             print("  ❌ 拆行不幂等 —— 重复调用会继续切碎")
+        # ④ 带段头的**首行**也必须 ≤ 阈值。
+        # ⚠️ 2026-11-20 生产实测漏网：13:40 那条拆完仍有 3 行超 88
+        # （**盘面**92 / **资金**92 / **热点**91），全是首行 ——
+        # 因为切分一律按 `LIMIT-2`（续行的 2 空格缩进），
+        # 而首行顶着 `**段名**`，两者可用宽度不同。
+        _wall_hd = (
+            "**盘面** 全面下跌、无权重护盘：上证 3511.53（-1.85%，涨 138 跌 2194）、"
+            "科创50 1225.46（-3.57%）、创业板指 2236.64（-2.47%）、"
+            "恒生指数 22318.95（-2.29%）。沪市成交 为上日全天的 85%，量能未见收缩。")
+        _rh = [x for x in _AN2._split_wall_lines(_wall_hd).split("\n") if x.strip()]
+        _lim2 = _AN2._SPLIT_LIMIT if isinstance(
+            getattr(_AN2, "_SPLIT_LIMIT", None), int) else 88
+        _over_hd = [len(x.strip()) for x in _rh if len(x.strip()) > _lim2]
+        if _over_hd:
+            _bad2 += 1
+            print(f"  ❌ 带段头的首行溢出 {_over_hd}（阈值 {_lim2}）—— "
+                  f"首行可用宽度是 `LIMIT - len(head)`，不是 `LIMIT - 2`；"
+                  f"2026-11-20 13:40 生产推送就是 92 字那种形态")
         if _bad2:
             print(f"  ❌ {_bad2} 项拆行判据不成立")
             ok_all = False

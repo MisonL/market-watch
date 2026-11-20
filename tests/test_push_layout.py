@@ -261,4 +261,38 @@ try:
 finally:
     A._log = _ORIG_LOG
 
+
+# ---------- ⑥ 首行必须按段头宽度扣掉可用宽度 ----------
+#
+# ⚠️⚠️ 2026-11-20 生产实测漏网：13:40 那条推送拆完后仍有 3 行超 88
+# （**盘面** 92 / **资金** 92 / **热点** 91），全是**首行**。
+# 根因：切分一律按 `_LIMIT - 2`（给续行的 2 空格缩进留位置），
+# 但首行前面顶着 `**段名**`（`**盘面** ` 占 9 字）—— 两者宽度不同，
+# 用一个常数切，首行就会溢出 `len(head)` 那么多。
+# 段名越长越离谱，而这个洞**测试原本抓不到**（旧断言只看「拆完最大行」
+# 用的是那条 289 字的假数据，恰好没触发）。
+_real13 = (
+    "**盘面** 全面下跌、无权重护盘：上证 3511.53（-1.85%，涨 138 跌 2194）、"
+    "科创50 1225.46（-3.57%）、创业板指 2236.64（-2.47%）、"
+    "恒生指数 22318.95（-2.29%）。沪市成交 为上日全天的 85%，量能未见收缩。")
+_out13 = A._split_wall_lines(_real13)
+_rows13 = [x for x in _out13.split("\n") if x.strip()]
+check(len(_rows13) >= 2, f"92 字带段头的段必须被拆，实得 {len(_rows13)} 行")
+_bad13 = [(len(x.strip()), x.strip()[:40]) for x in _rows13
+          if len(x.strip()) > A._SPLIT_LIMIT]
+check(not _bad13,
+      f"带段头的首行也必须 ≤{A._SPLIT_LIMIT}，超限 {_bad13} —— "
+      f"首行可用宽度是 `LIMIT - len(head)`，不是 `LIMIT - 2`")
+check(re.sub(r"\s", "", _out13) == re.sub(r"\s", "", _real13),
+      "首行扣宽不得丢内容")
+check(A._split_wall_lines(_out13) == _out13, "带段头的段拆完必须幂等")
+
+# 长段名（比普通 4 字段名更长）同样不能溢出
+_longhead = ("**关注板块与资金流** " +
+             "、".join(f"板块{i} -{i}.00%（-{i}0.0 亿）" for i in range(1, 12)))
+_ohl = [x for x in A._split_wall_lines(_longhead).split("\n") if x.strip()]
+check(all(len(x.strip()) <= A._SPLIT_LIMIT for x in _ohl),
+      f"长段名首行溢出：{[len(x.strip()) for x in _ohl]} —— "
+      f"段头越长，首行可用正文越窄")
+
 print(f"ALL PASS (推送排版拆行/残句 {_ok} 个断言)")
