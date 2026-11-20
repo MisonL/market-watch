@@ -2118,7 +2118,7 @@ def detect(q, sg, now, st):
         v2, v3 = _num(v.get("f2")), _num(v.get("f3"))
         if _hk_live:
             if v2 is not None and v2>=th: hits.append(("hstech_up", f"恒生科技{v2}≥{th}"))
-            dn = T("hstech_down", 3630)
+            dn = T("hstech_down", 3482.43)
             if v2 is not None and v2<=dn: hits.append(("hstech_down", f"恒生科技{v2}≤{dn}"))
             dr = T("hstech_drop", -1.5)
             if v3 is not None and v3<=dr: hits.append(("hstech_drop", f"恒生科技{v3:+.2f}%"))
@@ -2841,7 +2841,7 @@ def build_brief(q, sg, hits, now, hot=None, slot=None):
         # 等于把被禁的词根喂给 AI，与规则自相矛盾。
         L.append(f"  [观察触发线] 恒生科技 上方 {th_h}"
                  f"（距离 {(th_h/v['f2']-1)*100:+.2f}%），"
-                 f"下方 {threshold('hstech_down',3630)}")
+                 f"下方 {threshold('hstech_down',3482.43)}")
 
     # deadline 时段专用：告诉 AI「今天之后还有几个可操作的交易日」。
     # deadline slot 的 rule 要求它按实际紧迫程度措辞，但原先 brief 里
@@ -6805,12 +6805,37 @@ def _strip_placeholder_lines(txt):
 
     只删「整行就是一个占位标记」的情形；行内夹在真实数据中的
     不动（那些是“部分缺失”的真实描述，删了反而隐瞒）。
+
+    ⚠️⚠️ 2026-11-20（P1，实推缺陷）：删占位行时**必须连带删掉它上方的
+    孤儿段头**。
+    `[实测]` 生产 5 条推送里有光秃秃的 `**热点**` 段头、下面空无一字
+    （11-17 09:22、11-19 09:23/10:04、11-20 11:42 整点播报）。
+    成因：模板在候选池为空时写的是
+        `**热点**\n  （本段无数据）`
+    本函数把「（本段无数据）」当占位删掉，**段头却留了下来** ——
+    读者看到"热点"标题、下面什么都没有，像是渲染坏了；
+    而这条推送还标着「无占位内容」（我们自己的日志说"已剔除"）。
+    判据：被删行若紧跟在**只有段头的行**（`**xxx**` 或 `**xxx**（…）`）
+    之后，且该段头在删除后**再无任何正文**，就把段头一起删。
     """
     if not txt:
         return txt
+    _lines = txt.split("\n")
     _out = []
-    for _l in txt.split("\n"):
+    for _i, _l in enumerate(_lines):
         if _PLACEHOLDER_RE.match(_l):
+            # 看上一行是不是孤儿段头（纯 `**xxx**`，或 `**xxx**（…）`）
+            _prev = _out[-1].strip() if _out else ""
+            if re.fullmatch(r"\*\*[^*]+\*\*(（[^）]*）)?", _prev):
+                # 段头下面若再没有正文（下一个非空行是别的段头/空/末尾），
+                # 就把段头一起删掉，别留一个空壳标题。
+                # ⚠️ 判据只认 ** 开头的新段头。`> ` 是**引用块正文**
+                # （建议段就是这种形态），不是新段 —— 把它算进来会误删
+                # `**建议**` 那种"段头 + 引用正文"的正常段。
+                _rest = [x for x in _lines[_i + 1:] if x.strip()]
+                if not _rest or _rest[0].strip().startswith("**"):
+                    _out.pop()
+                    continue
             continue
         _out.append(_l)
     _res = "\n".join(_out)
