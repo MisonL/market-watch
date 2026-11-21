@@ -255,6 +255,43 @@ for _t in tests/*.py; do
     fi
 done
 
+# ---------- CI 对等检查：在"没有 claude CLI"的假设下再跑一遍 AI 相关用例 ----------
+#
+# ⚠️⚠️ 2026-11-21（真实事故）：连续 **5 次** push 的 GitHub Actions 全红
+# （`test_ai_observability.py` rc=1），而本地 `run_all` 一直 58/58 全绿。
+# 差别只有一处 —— **CI 的 ubuntu 上没装 claude CLI**，于是 `ai_analyze()`
+# 在 `_invoke` 之前就 `return ""`，留痕日志一条不出；本地装了 CLI，
+# 所以永远复现不出来。
+#
+# 这就是「本地绿 ≠ CI 绿」的典型形态：判据依赖了**本机环境**，
+# 而环境差异只在远端暴露。修测试（桩掉 `claude_bin`）是治本；
+# 这一段是**防复发**：每个用例都必须在"没有 CLI"的假设下也能过。
+#
+# 只跑涉及 AI 的用例，成本约 1s（全套跑两遍要多 40s，不划算）。
+if [ -z "${MW_NO_CLAUDE_CLI:-}" ]; then
+    _parity_fail=""
+    for _t in tests/test_ai_budget_unlimited.py tests/test_ai_launch_retry.py \
+              tests/test_ai_observability.py tests/test_ai_round_deadline.py \
+              tests/test_ai_stall_attribution.py tests/test_push_layout.py \
+              tests/test_slot_advice_rule.py tests/test_empty_text_gate.py; do
+        [ -f "$_t" ] || continue
+        # 用一个 SKIPNOENV 敏感的解释器探测失败时直接跳过本段
+        if MW_NO_CLAUDE_CLI=1 timeout "$_TEST_TIMEOUT" "$_SYS_PY" "$_t" \
+                >/dev/null 2>&1; then :; else
+            _parity_fail="$_parity_fail $(basename "$_t")"
+        fi
+    done
+    if [ -n "$_parity_fail" ]; then
+        echo
+        echo "❌ CI 对等检查失败（没有 claude CLI 时这些用例挂了）：$_parity_fail"
+        echo "   → 它们依赖了「本机装了 CLI」这个前提。CI 上必然红，"
+        echo "     请在用例里桩掉 M.claude_bin（见 test_ai_observability.py）"
+        _n_fail=$((_n_fail + 1))
+    else
+        echo "  ✅ CI 对等检查：无 CLI 时 AI 相关用例全通过"
+    fi
+fi
+
 echo
 echo "通过 $_n_ok / 跳过 $_n_skip / 失败 $_n_fail"
 

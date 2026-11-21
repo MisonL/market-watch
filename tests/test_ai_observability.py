@@ -84,18 +84,38 @@ except OSError:
 
 
 def _run(raw, label):
-    """跑一次真实 ai_analyze，返回 AI 级别的日志行。"""
+    """跑一次真实 ai_analyze，返回 AI 级别的日志行。
+
+    ⚠️⚠️ **必须同时桩 `claude_bin`**（2026-11-21 CI 实测坐实）。
+    `ai_analyze()` 在调 `_invoke` 之前有一道闸：
+
+        binp, bindir = M.claude_bin()
+        if not binp:
+            _log("claude CLI 未找到，跳过 AI 调用（将用兜底模板）")
+            return ""
+
+    本机装了 claude CLI 所以本地永远走得通；而 **CI 跑在 ubuntu 上，没有
+    CLI** → 直接 return，`_invoke` 一次都没进 → 留痕日志当然一条不出 →
+    断言"完整流下没有产生 AI 级别日志"报 ❌。
+    这个测试因此在 GitHub Actions 上**连挂 4 次提交**，而我只看本地
+    `run_all 56/56` 没看 CI —— 「本地绿 ≠ CI 绿」，环境差异正是判据的边界。
+    """
     logs = []
     _sv_log = M.log
     _sv_wd = M.run_with_idle_watchdog
+    _sv_cb = M.claude_bin
     M.log = lambda m, tag="": logs.append((tag, str(m)))
     A.M.log = M.log
+    # 桩成"存在且可执行"的假路径：真正的执行被下面的 watchdog 桩拦掉，
+    # 不会真的跑任何二进制。
+    M.claude_bin = lambda: ("/bin/echo", "/bin")
     M.run_with_idle_watchdog = lambda *a, **k: (0, raw, "", False)
     try:
         A.ai_analyze(BODY, [], "# 计划", slot="15:00")
     finally:
         M.log = _sv_log
         M.run_with_idle_watchdog = _sv_wd
+        M.claude_bin = _sv_cb
     return [m for t, m in logs if t == "AI"]
 
 
@@ -118,14 +138,17 @@ try:
     logs = []
     _sv_log = M.log
     _sv_wd = M.run_with_idle_watchdog
+    _sv_cb3 = M.claude_bin
     M.log = lambda m, tag="": logs.append((tag, str(m)))
     A.M.log = M.log
+    M.claude_bin = lambda: ("/bin/echo", "/bin")
     M.run_with_idle_watchdog = lambda *a, **k: (0, INIT + "\n" + ASSIST, "", True)
     try:
         A.ai_analyze(BODY, [], "# 计划", slot="15:00")
     finally:
         M.log = _sv_log
         M.run_with_idle_watchdog = _sv_wd
+        M.claude_bin = _sv_cb3
     ai = [m for t, m in logs if t == "AI"]
     check(ai, "被掐停的调用没有日志 —— 那正是最需要看清模型的场合")
     check("掐停" in ai[0], f"掐停未在日志里标出，实得 {ai[0][:120]!r}")
