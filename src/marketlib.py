@@ -2587,6 +2587,31 @@ def _fallback_get(url, ref=None, host=None, timeout=20):
         # 这与本文件 `_HOLIDAY_WARN_FILE` 用的是**同一套**机制与理由。
         _perm_dead_log_once(host)
         return None
+    # ⚠️⚠️ 2026-11-21（P1）：兜底链的超时**不得超过本轮剩余预算**。
+    # 代理 25s + firecrawl（`timeout*2`，上限 90s）是整条链最贵的尾巴，
+    # 而它只在"直连已经失败"之后才走 —— 那时预算往往所剩无几。
+    # `[实测]` 11:42 那轮：11:40:20 直连超时 17s 之后，一路拖到 11:42:10
+    # 的 firecrawl TimeoutExpired，白烧 90s；整轮 300s 里 AI 一分钱没拿到。
+    #
+    # 钳制而不是直接跳过：预算还有几十秒时，firecrawl 仍有机会成功
+    # （全量日志里 firecrawl 兜底**成功 12 次** / 无输出 29 / 非 JSON 9，
+    # 成功率约 24%，不能一刀切掉）。只把它的超时压到"剩余多久"。
+    # 预算**已耗尽**时不发起（`cj()` 已在调用前拦过一次，这里是防御层）。
+    _lft = data_left()
+    if _lft is not None:
+        if _lft <= 0:
+            _daily_log_once(f"no-grace-{host or ''}", "fcfallback",
+                            f"取数预算已耗尽，不发起代理/firecrawl 兜底: "
+                            f"{url[:60]}")
+            return None
+        _t_want = max(1, int(timeout or 20))
+        if _lft < _t_want:
+            _daily_log_once(f"clamp-{host or ''}", "fallback-clamp",
+                            f"兜底超时按剩余预算收紧: {_t_want}s → "
+                            f"{int(_lft)}s（{host or '未命名主机'}）")
+            # ⚠️ 必须 `max(1, …)`：`int(0.5)` = 0，会把超时传成 **0 秒**
+            # （curl `--max-time 0` 语义是"不限制"，比不钳还糟）。
+            timeout = max(1, int(_lft))
     _d = proxy_json(url, ref=ref, timeout=timeout)
     if _d is not None:
         _proxy_fallback_log_once(host)

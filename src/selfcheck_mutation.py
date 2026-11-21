@@ -4631,6 +4631,24 @@ MUTANTS = [
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
 
+    # --- 兜底链超时钳制（2026-11-21，P1）---
+    # 11:42 直连超时后白烧 firecrawl 90s，整轮 300s、AI 一分钱没拿到。
+    ("data-fallback-timeout-unclamped",
+     "marketlib.py",
+     '        if _lft < _t_want:',
+     '        if False:   # 注入：不钳',
+     "[兜底钳制] 兜底超时不按剩余预算收紧 → 代理 25s + firecrawl 90s "
+     "照样越过上限（11:42 白烧 90s 的形态）",
+     "剩 4s 时兜底超时仍为"),
+
+    ("data-fallback-timeout-zero",
+     "marketlib.py",
+     '            timeout = max(1, int(_lft))',
+     '            timeout = int(_lft)   # 注入：去掉下限',
+     "[兜底钳制] 去掉 max(1,..) → int(0.5)=0，curl --max-time 0 语义是"
+     "「不限制」，比不钳更糟",
+     "int() 截成 0"),
+
     # --- AI 调用留痕（2026-11-21，P1 可观测性）---
     # `AI_MODEL=None` 走 CLI 默认模型，那个 id 只在上游，日志里从来没记过。
     # 11-20 排查 AI 变慢时只能手工跑 CLI 才知道是 claude-fable-5。

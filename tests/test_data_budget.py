@@ -577,4 +577,71 @@ finally:
     _M8._daily_log_once = _save8b["dlo"]
     _M8.set_data_deadline(None)
 
-print(f"ALL PASS (取数上限 + 编排闸 + 慢取数留痕 + 入口零发包 {_ok} 个断言)")
+
+# ---------- ⑨ 兜底链超时不得超过剩余预算（2026-11-21，P1）----------
+#
+# 代理 25s + firecrawl（`timeout*2` 上限 90s）是整条链最贵的尾巴，而它只在
+# "直连已失败"之后才走 —— 那时预算往往所剩无几。
+# `[实测]` 11:42：11:40:20 直连超时 17s 后一路拖到 11:42:10 的 firecrawl
+# TimeoutExpired，白烧 90s，整轮 300s 里 AI 一分钱没拿到。
+#
+# ⚠️ 用**钳制**而不是直接跳过：全量日志里 firecrawl 兜底**成功 12 次**
+# （无输出 29 / 非 JSON 9，成功率约 24%），一刀切会白丢这 24%。
+_save9 = {"proxy": _M8.proxy_json, "fc": _M8.firecrawl_json,
+          "log": _M8.log, "dlo": _M8._daily_log_once,
+          "pdead": _M8.PERMANENTLY_DEAD}
+
+
+def _capture9(left):
+    """在给定剩余预算下调用 _fallback_get，返回 (proxy超时, firecrawl超时)。"""
+    _cap9 = {}
+    _M8.proxy_json = lambda url, ref=None, timeout=20: (
+        _cap9.__setitem__("proxy", timeout), None)[1]
+    _M8.firecrawl_json = lambda url, timeout=90: (
+        _cap9.__setitem__("fc", timeout), None)[1]
+    _M8.log = lambda m, lv=None: None
+    _M8._daily_log_once = lambda *a, **k: None
+    _M8.PERMANENTLY_DEAD = set()
+    _M8.set_data_deadline(None if left is None else time.time() + left)
+    try:
+        _M8._fallback_get("http://x.test/a", timeout=20)
+    finally:
+        _M8.set_data_deadline(None)
+    return _cap9
+
+
+try:
+    # 未设截止：不钳（原有的 20 / 40 必须原样）
+    _c9 = _capture9(None)
+    check(_c9.get("proxy") == 20, f"未设截止时 proxy 超时被改了：{_c9.get('proxy')}")
+    check(_c9.get("fc") == 40, f"未设截止时 firecrawl 超时被改了：{_c9.get('fc')}")
+
+    # 预算充足（120s > 20s）：同样不钳
+    _c9 = _capture9(120)
+    check(_c9.get("proxy") == 20, f"预算充足时不应钳制，实得 {_c9.get('proxy')}")
+
+    # 预算不足（4s）：必须收紧到剩余量级
+    _c9 = _capture9(4)
+    check(_c9.get("proxy") is not None and _c9["proxy"] <= 4,
+          f"剩 4s 时 proxy 超时仍为 {_c9.get('proxy')}s —— 会越过预算 20s")
+    check(_c9.get("fc") is not None and _c9["fc"] <= 80,
+          f"剩 4s 时 firecrawl 仍用 {_c9.get('fc')}s —— 90s 的尾巴没被压住")
+
+    # 极小剩余（0.5s）：不能被 int() 截成 0（curl --max-time 0 = 不限制！）
+    _c9 = _capture9(0.5)
+    check(_c9.get("proxy") is not None and _c9["proxy"] >= 1,
+          f"剩 0.5s 时 proxy 超时变成 {_c9.get('proxy')!r} —— "
+          f"int(0.5)=0 会让 curl 变成「不限制」，比不钳更糟")
+
+    # 已耗尽：兜底链一步都不发起
+    _c9 = _capture9(-1)
+    check(not _c9, f"预算已耗尽时仍发起了兜底（{_c9}）")
+finally:
+    _M8.proxy_json = _save9["proxy"]
+    _M8.firecrawl_json = _save9["fc"]
+    _M8.log = _save9["log"]
+    _M8._daily_log_once = _save9["dlo"]
+    _M8.PERMANENTLY_DEAD = _save9["pdead"]
+    _M8.set_data_deadline(None)
+
+print(f"ALL PASS (取数上限 + 编排闸 + 慢取数留痕 + 入口零发包 + 兜底钳制 {_ok} 个断言)")

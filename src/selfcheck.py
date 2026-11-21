@@ -1089,6 +1089,11 @@ def _snap_stubs():
                                     # 数出 0 次尝试（我第一次就撞上了这个）。
                                     "_fallback_get", "_host_dead",
                                     "PERMANENTLY_DEAD",
+                                    # ⑩ 号兜底钳制要数"传进去的超时是多少"，
+                                    # 故替换 firecrawl_json / proxy_json。
+                                    # proxy_json 原本就在名单，firecrawl_json
+                                    # 属"新增桩忘记登记"（由 [桩泄漏] 抓出）。
+                                    "firecrawl_json",
                                     # 同段还桩了 data_expired 的取值来源
                                     # （通过 set_data_deadline，已含在下面
                                     # 的还原里，不单列为桩）。
@@ -12104,6 +12109,57 @@ def _main(ok_all):
             _bad5 += 1
             print(f"  ❌ cj 重试链判据异常: {_e9}")
 
+        # ⑩ 兜底链（代理 + firecrawl）的超时不得超过剩余预算。
+        # `[实测]` 11:42：直连超时之后又白烧了 firecrawl 的 90s，
+        # 整轮 300s、AI 一分钱没拿到。用**钳制**而非跳过 —— firecrawl
+        # 成功率约 24%（12 成功 / 50 次），一刀切会白丢这部分。
+        try:
+            _svb = (_M5.proxy_json, _M5.firecrawl_json, _M5.log,
+                    _M5._daily_log_once, _M5.PERMANENTLY_DEAD)
+            try:
+                def _cap10(left):
+                    _c10 = {}
+                    _M5.proxy_json = lambda u, ref=None, timeout=20: (
+                        _c10.__setitem__("p", timeout), None)[1]
+                    _M5.firecrawl_json = lambda u, timeout=90: (
+                        _c10.__setitem__("f", timeout), None)[1]
+                    _M5.log = lambda m, lv=None: None
+                    _M5._daily_log_once = lambda *a, **k: None
+                    _M5.PERMANENTLY_DEAD = set()
+                    _M5.set_data_deadline(
+                        None if left is None else time.time() + left)
+                    try:
+                        _M5._fallback_get("http://x.test/a", timeout=20)
+                    finally:
+                        _M5.set_data_deadline(None)
+                    return _c10
+
+                _c10 = _cap10(None)
+                if _c10.get("p") != 20 or _c10.get("f") != 40:
+                    _bad5 += 1
+                    print(f"  ❌ 未设截止时兜底超时被改了（{_c10}）—— "
+                          f"不得误伤无截止场景")
+                _c10 = _cap10(4)
+                if not _c10 or _c10.get("p", 99) > 4:
+                    _bad5 += 1
+                    print(f"  ❌ 剩 4s 时兜底超时仍为 {_c10.get('p')}s —— "
+                          f"会越过预算（11:42 白烧 90s 的形态）")
+                _c10 = _cap10(0.5)
+                if _c10.get("p", 0) < 1:
+                    _bad5 += 1
+                    print(f"  ❌ 剩 0.5s 时超时变成 {_c10.get('p')!r} —— "
+                          f"int() 截成 0 等于 curl「不限制」，比不钳更糟")
+                _c10 = _cap10(-1)
+                if _c10:
+                    _bad5 += 1
+                    print(f"  ❌ 预算已耗尽仍发起兜底链（{_c10}）")
+            finally:
+                (_M5.proxy_json, _M5.firecrawl_json, _M5.log,
+                 _M5._daily_log_once, _M5.PERMANENTLY_DEAD) = _svb
+        except Exception as _e10:
+            _bad5 += 1
+            print(f"  ❌ 兜底钳制判据异常: {_e10}")
+
         # ⑦ 慢取数必须留痕 —— 行情/分时两处耗时日志都得在。
         # `[实测]` 11:42 那轮前 143s 全程无日志，只能靠后面 clist 那行
         # 「本轮已用 143s」反推，无法归因到具体哪一步（我当时先误判成 news）。
@@ -12120,7 +12176,7 @@ def _main(ok_all):
             print("  ✅ data_cap 真钳到剩余、无截止不误伤、留痕去重、"
                   "hot 两处已接、run 按本轮起点设截止、行情/分时耗时留痕、"
                   "预算耗尽时 quotes 零发包且不判死主机、"
-                  "cj 重试/兜底链受预算约束")
+                  "cj 重试/兜底链受预算约束、兜底超时按剩余预算钳制")
     except Exception as e:
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
