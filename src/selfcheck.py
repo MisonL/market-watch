@@ -1097,6 +1097,9 @@ def _snap_stubs():
                                     # [行情源可信度] 要把 push2test 排到首位来
                                     # 验证"它给的数据不会被采用"，故替换排序函数。
                                     "_ordered_em_hosts",
+                                    # [日K日期合理性] 要隔离磁盘日K缓存，
+                                    # 否则读到的是"缓存 + 桩数据"，断言无意义。
+                                    "dcache_get",
                                     # 同段还桩了 data_expired 的取值来源
                                     # （通过 set_data_deadline，已含在下面
                                     # 的还原里，不单列为桩）。
@@ -12301,6 +12304,74 @@ def _main(ok_all):
             ok_all = False
         else:
             print("  ✅ 实时行情不使用 push2test（伪造源），clist 仍保留它")
+    except Exception as e:
+        _unverified[0] += 1
+        print(f"  ❌ {e}"); ok_all = False
+
+    # 14e-4c) 板块日K 不得含「不可能存在的交易日」。
+    #
+    # `[实测]` 2026-11-21（周六）push2test 给出的序列里有
+    #     2026-11-21,2149.91,2217.80,2234.82,2149.91,17821
+    # 周六不可能有交易 —— 合成数据。它会进 `levels()` 的 20 日高/低，
+    # 把 h20 抬高、让「距 20 日高」显得更乐观（偏差不报警，只偏乐观）。
+    print("\n[日K日期合理性]")
+    try:
+        import marketlib as _M9k
+        import datetime as _dt9
+        _bad9 = 0
+        _today9 = _dt9.date.today()
+        _sv9 = (_M9k.cj, _M9k.log, _M9k.dcache_get)
+        # ⚠️⚠️ 必须走 `_isolate_dcache()` 做**段级重定向**，不能只桩 `dcache_get`。
+        # `[实测]` 2026-11-21：只桩读取，`_kline_ohlc()` 仍会 `dcache_set()` 写
+        # **生产 cache/daily.json** —— 自检的 [检查项可失败性] 当场拦下并报
+        # 「自检探针把共享缓存写进了本目录的生产缓存（daily.json…）」。
+        # 危害是双向的（见 `_isolate_dcache` 的说明）：键名与真实轮次同名，
+        # 真实轮次读到会当命中；撞上 K 线源抖动还会写 `__none__` 标记，
+        # 让真实管线在 30 分钟内关键位整段消失。
+        _restore_dc9 = _isolate_dcache()
+        try:
+            _days9 = []
+            _d9 = _today9
+            while len(_days9) < 25:
+                if _d9.weekday() < 5:
+                    _days9.append(_d9)
+                _d9 -= _dt9.timedelta(days=1)
+            _days9.reverse()
+            _bars9 = [f"{x.isoformat()},2000.00,2000.00,2100.00,1900.00,1000000"
+                      for x in _days9]
+            _fut9 = _today9 + _dt9.timedelta(days=400)
+            # ⚠️ 这根"未来日"必须用**正常价位**（开/收/高/低都在既有区间内）。
+            # 第一版写的是 9999，结果被下面既有的「单根跳变 >15% 只剔这一根」
+            # 逻辑**先摘掉了** —— 于是判据看到 ✅，而它测的根本不是日期规则。
+            # 只改日期、不动数值，才能把"日期合理性"这一条单独隔离出来。
+            _bars9.append(
+                f"{_fut9.isoformat()},2000.00,2000.00,2100.00,1900.00,1000000")
+            _M9k.cj = lambda url, **k: {"data": {"klines": _bars9}}
+            _M9k.log = lambda m, lv=None: None
+            _M9k.dcache_get = lambda key: None
+            _M9k.set_data_deadline(None)
+            _rows9 = _M9k._kline_ohlc("90.BK1137")
+            if _rows9 is None:
+                _bad9 += 1
+                print("  ❌ 剔除后不足 20 根就判源损坏 —— 正常历史被牵连")
+            else:
+                if any(str(_r[0]) == str(_fut9) for _r in _rows9):
+                    _bad9 += 1
+                    print(f"  ❌ 未来日（{_fut9}）的 K 线没被剔除 —— "
+                          f"合成根会污染板块 20 日高/低（2026-11-21 周六那根）")
+                if len(_rows9) != len(_days9):
+                    _bad9 += 1
+                    print(f"  ❌ 保留 {len(_rows9)} 根 ≠ 真实 {len(_days9)} 根 —— "
+                          f"剔除逻辑误伤了正常历史")
+        finally:
+            _restore_dc9()
+            (_M9k.cj, _M9k.log, _M9k.dcache_get) = _sv9
+            _M9k.set_data_deadline(None)
+        if _bad9:
+            print(f"  ❌ {_bad9} 项日K日期合理性判据不成立")
+            ok_all = False
+        else:
+            print("  ✅ 未来日/休市日的 K 线被剔除，正常历史完整保留")
     except Exception as e:
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False

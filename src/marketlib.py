@@ -2823,6 +2823,38 @@ def _kline_ohlc(secid, n=61):
                         float(x.split(",")[5]) if len(x.split(",")) > 5 else 0.0,
                         float(x.split(",")[2]) if len(x.split(",")) > 2 else 0.0)
                        for x in kl]
+            # ⚠️⚠️ 2026-11-21（P0 数据正确性）：剔除**不可能存在的交易日**。
+            #
+            # 板块日K 的唯一来源是 `EM_TEST`（push2test，腾讯无板块接口）。
+            # 实测 2026-11-21（周六，休市）：它给出的序列里赫然有
+            #     2026-11-21,2149.91,2217.80,2234.82,2149.91,17821
+            # —— **周六的 K 线**。周六不可能有交易，这根只能是合成/模拟。
+            #
+            # 危害：`levels()` 的 20 日高/低会把这根假 K 算进去，而板块的
+            # 「关键位」是推送给读者判断位置的依据。一根伪造的当日高点
+            # 就能把 h20 抬高、让「距 20 日高 -x%」显得更乐观。
+            #
+            # 这也是同一台主机今日已被证实会返回**伪造实时行情**的旁证
+            # （见 `quotes()` 里 `em_hosts` 的注释：3701.71 vs 真值 3533.79）。
+            # 不能整条弃用（那会让板块关键位永远消失），但**明显不可能
+            # 存在的日期**必须剔掉 —— 与下方"宁可缺数据，不给错的数"同源。
+            _today2 = datetime.date.today()
+            _raw2 = _fresh2
+            _fresh2 = []
+            _drop2 = 0
+            for _r in _raw2:
+                try:
+                    _d2 = datetime.date.fromisoformat(str(_r[0])[:10])
+                except Exception:
+                    _drop2 += 1
+                    continue
+                if _d2 > _today2 or not is_trading_day(_d2, warn=False):
+                    _drop2 += 1
+                    continue
+                _fresh2.append(_r)
+            if _drop2:
+                log(f"K线源含 {_drop2} 根不可能存在的交易根（未来日/休市日，"
+                    f"疑似合成数据），已剔除: {secid}", "FEED")
             if _hist:
                 _new2 = [r for r in _fresh2 if r[0] > _hist[-1][0]]
                 rows = _hist + _new2
