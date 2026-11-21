@@ -90,28 +90,39 @@ check(_out in ("ABSENT", "0"),
 	f" tier，80%/90%预警从此永久失效（线上实测残留值9）")
 
 # ══════════⑦进程组：leader退出后仍要杀整组 ══════════
-import ast # noqa: E402
-
+#⚠️ agent/是**独立子仓库**，CI里不 clone（参照 test_scheduler的同一约定）。
+#缺目录时不能直接 open() ——那会让整个文件 rc=1，把前面12条已经验过的
+#断言一起拖成"失败"。这里显式记一笔跳过，并在末行写明，不装作验过。
+_skipped = []
 _p = os.path.join(ROOT, "agent", "run.py")
-_tree = ast.parse(open(_p, encoding="utf-8").read())
-_fn = next(n for n in _tree.body
-	if isinstance(n, ast.FunctionDef) and n.name == "_killpg")
-_ns = {"os": os, "signal": __import__("signal"), "time": __import__("time")}
-exec(compile(ast.Module(body=[_fn], type_ignores=[]), _p, "exec"), _ns)
-_code = "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(300)"
-_pr = subprocess.Popen([sys.executable, "-c", _code], start_new_session=True)
-__import__("time").sleep(0.4)
-_g = os.getpgid(_pr.pid)
-_ns["_killpg"](_pr, grace=0.3)
-__import__("time").sleep(0.4)
-try:
-	os.killpg(_g,0)
-	_alive = True
-except OSError:
-	_alive = False
-check(_alive is False,
-	"leader退出后直接 return，忽略 SIGTERM的孙进程仍然存活 ->孤儿继续写文件并推群")
-if _pr.poll() is None:
-	_pr.kill()
+if not os.path.exists(_p):
+	_skipped.append("killpg整组（agent/未 clone）")
+else:
+	import ast # noqa: E402
 
-print(f"ALL PASS (第三轮审计修复 {_ok[0]}个断言)")
+	_tree = ast.parse(open(_p, encoding="utf-8").read())
+	_fn = next(n for n in _tree.body
+		if isinstance(n, ast.FunctionDef) and n.name == "_killpg")
+	_ns = {"os": os, "signal": __import__("signal"), "time": __import__("time")}
+	exec(compile(ast.Module(body=[_fn], type_ignores=[]), _p, "exec"), _ns)
+	_code = "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(300)"
+	_pr = subprocess.Popen([sys.executable, "-c", _code], start_new_session=True)
+	__import__("time").sleep(0.4)
+	_g = os.getpgid(_pr.pid)
+	_ns["_killpg"](_pr, grace=0.3)
+	__import__("time").sleep(0.4)
+	try:
+		os.killpg(_g,0)
+		_alive = True
+	except OSError:
+		_alive = False
+	check(_alive is False,
+		"leader退出后直接 return，忽略 SIGTERM的孙进程仍然存活 ->孤儿继续写文件并推群")
+	if _pr.poll() is None:
+		_pr.kill()
+
+if _skipped:
+	print(f"ALL PASS (第三轮审计修复 {_ok[0]}个断言；"
+		f"{len(_skipped)}项未验证：{chr(65307).join(_skipped)})")
+else:
+	print(f"ALL PASS (第三轮审计修复 {_ok[0]}个断言)")
