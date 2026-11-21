@@ -594,7 +594,7 @@ def health():
     # 正好是 health() 想要的语义；取前两台即可（health 只是布尔探活，
     # 不需要把四台全打一遍 —— 那是纯耗配额）。
     try:
-        _em_hosts = M._ordered_em_hosts()[:2]
+        _em_hosts = M._ordered_real_em_hosts()[:2]
         d = M.cj(f"{_em_hosts[0]}/ulist.np/get?secids=1.000001&fields=f2"
                  f"&ut={M.UT}&fltt=2&invt=2", timeout=8, retries=1)
         # ⚠️ 必须套 bool()：_has_data 现在返回**内层 dict**（见其 docstring），

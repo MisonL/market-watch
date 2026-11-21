@@ -235,7 +235,7 @@ def index_quotes():
     # 这批 secid 全是指数/港股（STATIC_SIGMA 的键），三源实测逐位一致
     # （见 marketlib._codes_for_host 的说明），所以扩到四台是安全的；
     # 港股随后**无条件**被腾讯覆盖，即便某台给错也进不了判定。
-    for host in M._ordered_em_hosts():
+    for host in M._ordered_real_em_hosts():
         d = cj(f"{host}/ulist.np/get?secids={ids}&fields=f2,f3,f12,f14&ut={UT}&fltt=2&invt=2")
         try:
             # diff 有 list / dict 两种形状（见 marketlib.clist 同名注释）。
@@ -751,7 +751,7 @@ def check_market_fund(now, state, quotes_fn=None):
         if isinstance(_x, dict) and M.isnum(_x.get("f62")):
             d = {"data": {"diff": [_x]}}
     # 同上：走健康度排序，不再硬编码「push2delay 主 + push2test 备」。
-    for host in (M._ordered_em_hosts() if d is None else ()):
+    for host in (M._ordered_real_em_hosts() if d is None else ()):
         d = cj(f"{host}/ulist.np/get?secids=1.000001&fields=f12,f14,f62,f6&ut={UT}&fltt=2&invt=2")
         # isinstance 是必需的：`d and d.get(...)` 在 d 是 list/str/int 时
         # 直接 AttributeError，连试下一台主机的机会都没有。

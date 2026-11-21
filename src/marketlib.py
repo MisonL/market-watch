@@ -3738,6 +3738,39 @@ def _ordered_em_hosts():
         return (perm, dead, -rate, -last_ok)
     return sorted(EM_HOSTS, key=key)
 
+
+def _ordered_real_em_hosts():
+    """行情主机候选，**剔除测试环境 push2test**。
+
+    ⚠️⚠️2026-11-21（P0数据正确性，第三次收口）：实时行情**一律走这里**，
+不要直接调 `_ordered_em_hosts()`。
+
+背景：`EM_HOSTS`里的 `EM_TEST`（push2test.eastmoney.com）是**测试环境**，
+返回的是一份它自己的模拟盘。`[实测]`2026-11-21对同一批标的：
+
+    f2点位2212.34 vs真值2001.74
+    f3涨跌幅 +3.24% vs真值 -6.59% ←符号相反
+    f62主力 -3316万 vs真值 -9.8亿 ←差30倍
+日K11-20收1892.10 vs真值2001.74（且伪造出周六的 K线）
+
+这个源"看起来健康"（有限正数、时间戳新鲜、无跳变），`_valid_quotes()`
+与新鲜度闸门都拦不住，`_mark_dead`也不会判它死 ——所以它还会被
+    **排序到第一位**（滚动统计里它139/0，比真主机"还好")。
+
+    ##为什么要单独收口成一个函数
+
+修这个洞的过程是典型的「同一真值抄多份，改一处漏两处」：
+第一次只修 `quotes()` → `clist`漏网
+第二次补 `clist`/`trends2` →板块日K漏网
+第三次补板块日K → `alert`的大盘资金 / `feeds.health` /热点量比漏网
+
+每次都是"下一个消费方"。故改为**一个函数、所有实时消费方共用**，
+并由自检的 AST扫描强制「实时取数模块不得直接调 `_ordered_em_hosts()`」，
+让下一次新增消费方当场变红，而不是等用户看到假数据。
+    """
+    _t = _host_of(EM_TEST)
+    return [h for h in _ordered_em_hosts() if _host_of(h) != _t]
+
 # 港股 secid -> 腾讯代码。腾讯是港股的实际权威源（qt.gtimg.cn）。
 _TX_HK = {
     # ⚠️ 港股指数必须用 **r_ 前缀（实时）**：不带前缀的 hkHSI/hkHSTECH 是
@@ -4530,7 +4563,7 @@ def trend(sid):
         # 让整轮报告或整轮快照静默丢失
         return None
     hi = max(px) if px else 0
-    if not px or hi <= 0:
+    if not px or hi <=0 or px[-1] <=0 or px[0] <=0:
         # 停牌/集合竞价前，trends2 会返回全 0 的价格序列。
         # 此时 high==0，而调用方**三处**都在算 (last/high-1)*100：
         #   collect.py:58、analyze.py:230、analyze.py:343 —— 全部 ZeroDivisionError。

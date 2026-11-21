@@ -269,30 +269,47 @@ done
 #
 # 只跑涉及 AI 的用例，成本约 1s（全套跑两遍要多 40s，不划算）。
 if [ -z "${MW_NO_CLAUDE_CLI:-}" ]; then
-    _parity_fail=""
-    for _t in tests/test_ai_budget_unlimited.py tests/test_ai_launch_retry.py \
-              tests/test_ai_observability.py tests/test_ai_round_deadline.py \
-              tests/test_ai_stall_attribution.py tests/test_push_layout.py \
-              tests/test_slot_advice_rule.py tests/test_empty_text_gate.py; do
-        [ -f "$_t" ] || continue
-        # 用一个 SKIPNOENV 敏感的解释器探测失败时直接跳过本段
-        if MW_NO_CLAUDE_CLI=1 timeout "$_TEST_TIMEOUT" "$_SYS_PY" "$_t" \
-                >/dev/null 2>&1; then :; else
-            _parity_fail="$_parity_fail $(basename "$_t")"
-        fi
-    done
-    if [ -n "$_parity_fail" ]; then
-        echo
-        echo "❌ CI 对等检查失败（没有 claude CLI 时这些用例挂了）：$_parity_fail"
-        echo "   → 它们依赖了「本机装了 CLI」这个前提。CI 上必然红，"
-        echo "     请在用例里桩掉 M.claude_bin（见 test_ai_observability.py）"
-        _n_fail=$((_n_fail + 1))
-    else
-        echo "  ✅ CI 对等检查：无 CLI 时 AI 相关用例全通过"
-    fi
+ _parity_fail=""
+ for _t in tests/test_ai_budget_unlimited.py tests/test_ai_launch_retry.py \
+ tests/test_ai_observability.py tests/test_ai_round_deadline.py \
+ tests/test_ai_stall_attribution.py tests/test_push_layout.py \
+ tests/test_slot_advice_rule.py tests/test_empty_text_gate.py; do
+ [ -f "$_t" ] || continue
+ # ⚠️⚠️三个必须项（2026-11-21审计自查出的自身缺陷，均已实测确认）：
+ #① `MW_DIR`沙箱 ——原写法没设，于是这8条落到**生产根**上跑。
+ # `test_ai_observability.py`收尾会删 `ROOT/state/cache/ai_fail.json`,
+ #而它在沙箱里写的熔断文件走 `MW_DIR` ——结果每跑一次 run_all
+ #就删掉一次**生产**的 AI熔断文件，与该用例"不污染生产"的自述相反。
+ #② `$_TIMEOUT_BIN` ——原写法直接调裸 `timeout`，macOS无 coreutils
+ #时8条全部 rc=127，假报"对等失败"。
+ #③ `_failed` ——原写法只加 `_n_fail`（仅用于打印汇总），而退出码
+ #只看 `_failed`/`_n_skip`，于是**对等检查失败时 rc仍是0**,CI照样
+ #绿 ——这个"防复发闸门"自己就是假绿。
+ _pd=$(mktemp -d "$_TMPDIR/parity_XXXXXX") || _pd=""
+ if [ -n "$_TIMEOUT_BIN" ]; then
+ MW_DIR="$_pd" MW_NO_CLAUDE_CLI=1 PYTHONDONTWRITEBYTECODE=1 \
+ "$_TIMEOUT_BIN" "$_TEST_TIMEOUT" "$_SYS_PY" -B "$_t" \
+ >/dev/null 2>&1 || _parity_fail="$_parity_fail $(basename "$_t")"
+ else
+ MW_DIR="$_pd" MW_NO_CLAUDE_CLI=1 PYTHONDONTWRITEBYTECODE=1 \
+ "$_SYS_PY" -B "$_t" \
+ >/dev/null 2>&1 || _parity_fail="$_parity_fail $(basename "$_t")"
+ fi
+ [ -n "$_pd" ] && rm -rf "$_pd"
+ done
+ if [ -n "$_parity_fail" ]; then
+ echo
+ echo "❌ CI对等检查失败（没有 claude CLI时这些用例挂了）：$_parity_fail"
+ echo " →它们依赖了「本机装了 CLI」这个前提。CI上必然红，"
+ echo "请在用例里桩掉 M.claude_bin（见 test_ai_observability.py）"
+ _n_fail=$((_n_fail +1))
+ #必须进 `_failed`：否则 rc=0、CI绿 ——闸门形同虚设
+ _failed="$_failed parity(no-CLI)"
+ else
+ echo " ✅ CI对等检查：无 CLI时 AI相关用例全通过"
+ fi
 fi
 
-echo
 echo "通过 $_n_ok / 跳过 $_n_skip / 失败 $_n_fail"
 
 # ---------- 失败时把现场留在 tests/ 下 ----------

@@ -31,7 +31,7 @@ def main():
         if not old or str(old).startswith("__"):
             skipped += 1
             continue
-        path = os.path.join(ROOT, "src", fname)
+        path = (os.path.join(ROOT, fname) if "/" in fname else os.path.join(ROOT, "src", fname))
         if not os.path.exists(path):
             skipped += 1
             continue
@@ -52,7 +52,7 @@ def main():
         print("\n→ 改过对应源码的话，请同步更新 `selfcheck_mutation.py` 里的")
         print("   `old` / `new` 两侧字面量（必须逐字一致，含缩进与换行）。")
         return 1
-    print(f"ALL PASS ({total} 条锚点全部匹配，{skipped} 条特殊注入器跳过)")
+    print(f"ALL PASS ({total - skipped}条锚点实际匹配，{skipped}条跳过未校验)")
     return 0
 
 

@@ -2147,7 +2147,7 @@ def detect(q, sg, now, st):
         # 这里就会裸崩。补 .get 只会让缺口闭合，正常路径零变化。
         _s_last = _num(sg.get("last"))
         _s_open = _num(sg.get("open"))
-        if _s_last is not None and _s_open is not None:
+        if (_s_last is not None and _s_last >0 and _s_open is not None and _s_open >0):
             fh=(_s_last/sg["high"]-1)*100
             if fh<=T("storage_fade",-1.5) and _s_last<_s_open:
                 hits.append(("storage_rev", f"存储芯片自高点{fh:.2f}%"))
@@ -5390,7 +5390,7 @@ def _storage_from_snapshot(max_age_s=360, now=None):
         # (last/high-1)*100，high==0 是 ZeroDivisionError。
         if not (M.isnum(sg.get("last")) and M.isnum(sg.get("high"))):
             return None
-        if sg["high"] <= 0:
+        if sg["high"] <=0 or not (M.isnum(sg.get("last")) and sg["last"] >0):
             return None
         # 下游会**裸取**的其余字段，缺一个就放弃复用（见 docstring 的说明）。
         # open/low 供 build_brief 的日内行，am/pm 供量能行。
