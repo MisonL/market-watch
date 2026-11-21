@@ -12299,11 +12299,52 @@ def _main(ok_all):
              _M8q._daily_log_once) = _svq
             _fdq.backup_quotes = _svq_bk
             _M8q.set_data_deadline(None)
+        # ③ clist（板块列表）同样不得来自 push2test ——「关注板块/板块资金/
+        #    热点」段的每个数字都源自它。实测同一分钟：BK1295 其他数字媒体
+        #    我方 +15.0%（+5.08 亿）vs push2test +0.03%（36 万）；BK1137
+        #    存储芯片 f62 差 30 倍（-3316 万 vs -9.8 亿）。
+        _hq = [ _M8q._host_of(h) for h in _M8q._https_hosts()]
+        if _tst in _hq:
+            _badq += 1
+            print(f"  ❌ _https_hosts() 仍含 {_tst} —— clist/trends2 会拿到"
+                  f"测试环境的模拟盘（实测 f62 差 30 倍）")
+        if not _hq:
+            _badq += 1
+            print("  ❌ 剔除后 HTTPS 候选为空 —— 板块数据会整段消失，"
+                  "请确认 EM_HTTPS 在候选池里")
+        else:
+            _seenq2 = []
+            _svq2 = (_M8q.cj, _M8q.log, _M8q._daily_log_once)
+            try:
+                def _cjq2(url, **k):
+                    if _tst in url:
+                        _seenq2.append(url[:40])
+                        return {"data": {"total": 1,
+                                         "diff": [{"f12": "BK9999",
+                                                   "f14": "伪造板块",
+                                                   "f3": 88.8}]}}
+                    return None
+                _M8q.cj = _cjq2
+                _M8q.log = lambda m, lv=None: None
+                _M8q._daily_log_once = lambda *a, **k: None
+                _M8q.set_data_deadline(None)
+                _rq2 = _M8q.clist("m:90+t:2", "f12,f14,f3")
+                if "伪造板块" in [x.get("f14") for x in (_rq2 or [])]:
+                    _badq += 1
+                    print("  ❌ clist() 采用了 push2test 的伪造板块数据")
+                if _seenq2:
+                    _badq += 1
+                    print(f"  ❌ clist() 仍向 {_tst} 发起请求 —— "
+                          f"白打一个必然给出模拟盘的包")
+            finally:
+                (_M8q.cj, _M8q.log, _M8q._daily_log_once) = _svq2
+                _M8q.set_data_deadline(None)
         if _badq:
             print(f"  ❌ {_badq} 项行情源可信度判据不成立")
             ok_all = False
         else:
-            print("  ✅ 实时行情不使用 push2test（伪造源），clist 仍保留它")
+            print("  ✅ 实时行情与板块列表（clist/trends2）均不使用 push2test"
+                  "（测试环境的模拟盘）")
     except Exception as e:
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False

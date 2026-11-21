@@ -3461,8 +3461,33 @@ def _https_hosts():
     撞一次 push2delay。**同一个 bug 昨天在 feeds.health() 修过**，但那三处
     是另一份硬编码副本，漏改了（「同一真值抄两份，改一处漏两处」）。
     """
+    # ⚠️⚠️ 2026-11-21（P0 数据正确性）：**剔除 push2test**。
+    #
+    # 这台主机是测试环境，给的是一份**它自己的模拟盘**。`[实测]` 同一分钟
+    # 对同一批板块（`90.BK1137` 存储芯片）：
+    #
+    #     字段          push2test        push2（真）
+    #     f2 点位       2212.34          2001.74
+    #     f3 涨跌幅     +3.24%           -6.59%      ← 符号相反
+    #     f62 主力净流入 -33,157,908     -981,510,272 ← 差 30 倍
+    #
+    # 整张 clist（496 个板块）也是两套完全不同的排序与数值：
+    #     真：印制电路板 -0.10%（+20.4 亿）、元件 -1.21%
+    #     假：空调 +5.50%、白色家电 +5.32%
+    # 而「关注板块 / 板块资金 / 热点」段的每一个数字都来自 clist ——
+    # 用假源等于**整套板块结论都是编的**，且偏差不报警、只会显得行情很好。
+    #
+    # 原先不剔除的理由是「HTTP 下 clist 被端点级封锁（rc=52），只有 push2test
+    # 能取」。但那是 **HTTP** 的结论；`[实测]` 2026-11-21 push2 的 **HTTPS**
+    # clist 正常（rc=0、total=496）。EM_HTTPS 本就在候选池里（2026-11-10 加），
+    # 所以剔除后并不丢能力。
+    #
+    # 代价：push2 HTTPS 被限流时板块数据**整段消失**。按本仓库既有原则
+    # （"宁可缺数据，不给错的数" —— 见 `levels()` 的注释），这是对的取舍。
     return [h for h in _ordered_em_hosts()
-            if h.startswith("https://") and _host_of(h) not in PERMANENTLY_DEAD]
+            if h.startswith("https://")
+            and _host_of(h) not in PERMANENTLY_DEAD
+            and _host_of(h) != _host_of(EM_TEST)]
 
 # 明文 HTTP 行情主机集合（供 _codes_for_host 判断）。
 _EM_HTTP_HOSTS = {EM_HTTP, EM_HIS_HTTP}

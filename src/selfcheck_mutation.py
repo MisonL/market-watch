@@ -2953,8 +2953,12 @@ MUTANTS = [
     # 这个 bug 在 feeds.health() 修过一次，但三处是另一份硬编码副本，漏改了。
     ("https-hosts-include-permadead",
      "marketlib.py",
+     # ⚠️ 2026-11-21：源码多了「剔除 push2test」两行（见 clist-source-trust
+     # 那条），锚点同步 —— 否则本体会报"锚点漂移"而漏掉这条覆盖。
      "    return [h for h in _ordered_em_hosts()\n"
-     "            if h.startswith(\"https://\") and _host_of(h) not in PERMANENTLY_DEAD]",
+     "            if h.startswith(\"https://\")\n"
+     "            and _host_of(h) not in PERMANENTLY_DEAD\n"
+     "            and _host_of(h) != _host_of(EM_TEST)]",
      "    return [EM, EM_TEST]   # 注入：退回硬编码，不过滤永久封锁",
      "[行情主机排序] HTTPS 端点候选不得包含 PERMANENTLY_DEAD 主机"
      "（否则每次 clist/trend 都白撞一次 + 打噪音日志）",
@@ -4630,6 +4634,18 @@ MUTANTS = [
      '        _m_tl = re.search(r"\\[total-limit-gate (\\d+)s", se or "")',
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
+
+    # --- clist 也不得用测试源（2026-11-21，P0）---
+    # 「关注板块/板块资金/热点」每个数字都来自 clist；push2test 的模拟盘
+    # 实测同一板块 f62 差 30 倍（-3316 万 vs -9.8 亿）。
+    ("clist-source-trust-emtest",
+     "marketlib.py",
+     '            and _host_of(h) not in PERMANENTLY_DEAD\n'
+     '            and _host_of(h) != _host_of(EM_TEST)]',
+     '            and _host_of(h) not in PERMANENTLY_DEAD]   # 注入：含 push2test',
+     "[行情源可信度] clist/trends2 候选又含 push2test → 板块涨跌幅与主力"
+     "净流入整套取自模拟盘，偏差不报警、只会显得行情很好",
+     "_https_hosts() 仍含"),
 
     # --- 板块日K 剔除不可能存在的交易日（2026-11-21，P0）---
     # push2test 实测给出「2026-11-21（周六）」的 K 线，会污染 20 日高/低。

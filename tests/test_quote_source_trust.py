@@ -116,4 +116,53 @@ finally:
     M.log = _sv2["log"]
     M.set_data_deadline(None)
 
-print(f"ALL PASS (实时行情禁用测试源 push2test {_ok[0]} 个断言)")
+# ---------- ④ clist（板块列表）同样不得来自 push2test ----------
+#
+# 2026-11-21 同一分钟对同一批板块的实测：
+#
+#     板块             我们的源（push2）        push2test
+#     BK1295 其他数字媒体  f3=+15.0  f62=+5.08亿   f3=+0.03  f62=36万
+#     BK1296 视频媒体     f3=+3.19  f62=-789万     f3=+1.66  f62=0
+#
+# 「关注板块 / 板块资金 / 热点」段里每一个数字都来自 clist —— 用假源
+# 等于整套板块结论都是编的，而偏差不报警、只会显得行情很好。
+# 原先不剔除的理由是「HTTP 下 clist 被端点级封锁，只有 push2test 能取」，
+# 但那是 HTTP 的结论；push2 的 **HTTPS** clist 正常（实测 rc=0/total=496），
+# 且 `cj()` 的 firecrawl 兜底能绕过 IP 封锁（不同出口）拿到**真数据**
+# （实测 20.9s / 496 板块）。
+_hosts4 = [M._host_of(h) for h in M._https_hosts()]
+check(_EM_TEST_HOST not in _hosts4,
+      f"_https_hosts() 仍含 push2test（{_hosts4}）—— clist/trends2 会拿到"
+      f"测试环境的模拟盘：f62 实测差 30 倍（-3316 万 vs -9.8 亿）")
+check(len(_hosts4) >= 1,
+      "剔除 push2test 后 HTTPS 候选为空 —— 板块数据会整段消失，"
+      "请确认 EM_HTTPS 仍在候选池里")
+
+_seen4 = []
+_sv4 = {"cj": M.cj, "log": M.log, "dlo": M._daily_log_once}
+try:
+    def _cj4(url, **k):
+        if M._host_of(url) == _EM_TEST_HOST or "push2test" in url:
+            _seen4.append(url[:60])
+            return {"data": {"total": 1, "diff": [{"f12": "BK9999",
+                                                  "f14": "伪造板块",
+                                                  "f3": 88.8}]}}
+        return None
+    M.cj = _cj4
+    M.log = lambda m, lv=None: None
+    M._daily_log_once = lambda *a, **k: None
+    M.set_data_deadline(None)
+    rows4 = M.clist("m:90+t:2", "f12,f14,f3")
+    names4 = [r.get("f14") for r in (rows4 or [])]
+    check("伪造板块" not in names4,
+          f"clist() 采用了 push2test 的伪造板块数据：{names4[:3]}")
+    check(not _seen4,
+          f"clist() 竟向 push2test 发起了请求（{_seen4[:2]}）—— "
+          f"白打一个必然给出模拟盘的包")
+finally:
+    M.cj = _sv4["cj"]
+    M.log = _sv4["log"]
+    M._daily_log_once = _sv4["dlo"]
+    M.set_data_deadline(None)
+
+print(f"ALL PASS (实时行情/板块列表禁用测试源 push2test {_ok[0]} 个断言)")
