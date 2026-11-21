@@ -166,6 +166,14 @@ _FALLBACK_SLOT_TTL = {"09:25": 8, "10:00": 20, "11:30": 20,
 # 那些轮次会被判成"当日无该时段推送记录"（假告警）。
 # 同样被 selfcheck 的 [常量一致性] 比对。
 # 重试宽限，必须与 analyze.HOURLY_RETRY_GRACE 一致（同被 [常量一致性] 比对）。
+_FALLBACK_SLOT_VALID_UNTIL = {
+#ⓘ必须是**整数字面量**：selfcheck的 [常量一致性]用 ast.literal_eval
+#静态读取，写成 `9*60+35`会取不到 →被当成"没有兜底副本"。
+ "09:25":575, "10:00":635, "11:30":720, "13:30":870,
+ "14:30":900, "15:00":935, "summary":913, "deadline":900,
+}
+_SM_START =14 *60 +45
+_DL_START =13 *60 +30
 _RETRY_GRACE = 15
 _FALLBACK_SLOT_OPEN_EARLY = {"09:25": 8}
 _FALLBACK_SLOTS = [
@@ -185,7 +193,8 @@ _FALLBACK_SLOTS = [
 # 原先 docstring 声称还取 HOURLY —— 那是假的：analyze 里 HOURLY 是
 # `[(t, int(t[:2])*60+int(t[3:])) for t in TH["hourly"]]`，literal_eval
 # 求不了列表推导式，所以它**从来没被取到过**。这里如实写明，不再假装。
-_CONST_NAMES = ("SLOTS", "SLOT_TTL", "MAX_PUSH", "SLOT_OPEN_EARLY")
+_CONST_NAMES = ("SLOTS", "SLOT_TTL", "MAX_PUSH", "SLOT_OPEN_EARLY",
+ "SLOT_VALID_UNTIL")
 
 # MAX_PUSH 的兜底值：analyze.py 语法错误期间用它，保证面板仍可用。
 # 必须与 analyze.MAX_PUSH 一致 —— selfcheck 的 [常量一致性] 会比对两处。
@@ -275,6 +284,13 @@ _SLOT_TTL = dict(_FALLBACK_SLOT_TTL)
 _SLOT_TTL.update({k: v for k, v in _A_SLOT_TTL.items()
                   if isinstance(v, (int, float)) and not isinstance(v, bool)})
 _SLOT_TTL.setdefault("summary", 13)
+#窗口**硬上界**（内容失效时刻）。与 SLOT_TTL同一套策略：以兜底副本为底，
+#用 analyze解析出的合法值覆盖 ——解析失败时也不至于把14:30的窗口又撑到
+#15:05（那正是本条要修的 bug）。
+_A_SLOT_VU = _dict_const("SLOT_VALID_UNTIL")
+_SLOT_VALID_UNTIL = dict(_FALLBACK_SLOT_VALID_UNTIL)
+_SLOT_VALID_UNTIL.update({k: v for k, v in _A_SLOT_VU.items()
+ if isinstance(v, (int, float)) and not isinstance(v, bool)})
 _SLOT_TTL.setdefault("deadline", 95)
 
 # ⚠️ 与 _SLOT_TTL 同理：解析失败时必须回退，否则回退期容差下界恒为 -5，
@@ -1858,20 +1874,38 @@ def build_slots(date=None):
 
 
 def _slot_window_grace(key):
-    """该槽位的**有效窗口**宽度（分钟）。
+    """该槽位的**有效窗口**宽度（分钟，相对计划时刻）。
 
-    直接取 `analyze.SLOT_TTL`，逼不得已时就用默认 20 +
-    `HOURLY_RETRY_GRACE`。两处各写一份就会出现
-    “面板说漏推、实际还在窗口内”的分叉。
+    ⚠️⚠️2026-11-21（P1）：必须复现 `analyze.hourly_slot._in_grace`的
+    真实上界，即 min(TTL+宽限,下一窗口起点, SLOT_VALID_UNTIL)。
+    原实现只算 TTL+宽限，于是14:30那格到15:05都还显示「等待中」，
+    而实际14:45（summary窗口起点）起就不可能再推 ——恰好是
+    「决策时段」最需要补救的15分钟，操作员却被面板告知「还在窗口内」。
     """
-    # ⚠ 用本文件的 `_FALLBACK_SLOT_TTL`，**不要 import analyze**：
-    # 那样会触发连网、写 state.json 等副作用（见文件头注释）。
-    # 两份副本的一致性由 selfcheck 的 [常量一致性] 比对。
     try:
-        return int(_FALLBACK_SLOT_TTL.get(key, 20)) + _RETRY_GRACE
+        _t = _slot_min(key)
+        if _t is None: return int(_FALLBACK_SLOT_TTL.get(key, 20)) + _RETRY_GRACE
+        _ttl = int(_FALLBACK_SLOT_TTL.get(key,20))
+        _upper = _t + _ttl + _RETRY_GRACE
+        _cap = _next_start_after(_t)
+        if _cap is not None: _upper = min(_upper, _cap)
+        _vu = _SLOT_VALID_UNTIL.get(key)
+        if _vu is not None: _upper = min(_upper, _vu)
+        return max(1, _upper - _t)
     except Exception:
-        return 35
+        return int(_FALLBACK_SLOT_TTL.get(key, 20)) + _RETRY_GRACE
 
+
+def _next_start_after(target):
+    """严格晚于 target的下一个窗口起点（含提前开放与 summary/deadline）。
+
+    与 `analyze._grace_cap`同一口径：宽限不得吃掉别人的时段。
+    """
+    _starts = ([_slot_min(_k) - _FALLBACK_SLOT_OPEN_EARLY.get(_k,0)
+        for _k, _, _ in _FALLBACK_SLOTS if _slot_min(_k) is not None]
+    + [_DL_START, _SM_START])
+    _later = [x for x in _starts if x > target]
+    return min(_later) if _later else None
 
 def _slot_min(planned):
     """计划时刻 -> 距 0 点的分钟数。**无计划时刻返回 None**，不是 9999。

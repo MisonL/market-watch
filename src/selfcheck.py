@@ -2102,13 +2102,25 @@ def _main(ok_all):
                       "上限，实测挂起 >400s 且占着 lock）")
                 print("      → 找源是人工动作：手工跑 `python3 ~/.market-watch/src/feeds.py`")
             elif not h.get("eastmoney"):
+                #2026-11-21(P0): do NOT use push2test as proof that a fallback exists.
+                #It is a test host serving its own simulated book (measured f22212.34
+                #vs real2001.74, f62 off by30x). The old code fetched EM_TEST and, on
+                #success, printed "switched to fallback host push2test" -- using the fake
+                #source as evidence that "functionality is unaffected", exactly the
+                #opposite of this round P0 fixes. Check the REAL candidate pool instead.
                 import marketlib as _M
-                o = _M._fetch(_M.EM_TEST, ["1.000001"], "f2,f3")
-                if o:
-                    print("  ℹ️  主源被限流，已切换到备用行情主机 push2test（A股/板块）")
-                    print("      注意：该主机不提供可信的 60 日涨跌幅，已改为K线自算")
+                _real = _M._ordered_real_em_hosts()
+                _o = None
+                _used = None
+                for _h in _real[:3]:
+                    _o = _M._fetch(_h, ["1.000001"], "f2,f3")
+                    if _o:
+                        _used = _h
+                        break
+                if _o:
+                    print(" ℹ️主源被限流，已切到真实备用主机 " f"{_M._host_of(_used)}")
                 else:
-                    print("  ℹ️  东财不可用，但备用源正常，功能不受影响")
+                    print(" ℹ️东财不可用，但备用源正常，功能不受影响")
     except Exception as e:
         print(f"  ❌ 模块导入失败: {e}"); ok_all = False
 

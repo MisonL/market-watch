@@ -142,7 +142,7 @@ def _log_illegal_status(v):
 
 
 def _ensure_dir():
-    os.makedirs(HIST_DIR, exist_ok=True)
+    os.makedirs(HIST_DIR, mode=0o700, exist_ok=True)
 
 
 def _mk600(path, flags=None):
@@ -742,7 +742,7 @@ def beat(job):
         _lk = None
         try:
             import fcntl
-            os.makedirs(os.path.dirname(BEAT_FILE), exist_ok=True)
+            os.makedirs(os.path.dirname(BEAT_FILE), mode=0o700, exist_ok=True)
             # ⚠ 2026-11-11：必须显式 0o600。`open(..., "a+")` 按 umask 创建
             # （launchd 下 umask 022 → 644），自检的「状态/日志/锁文件权限」
             # 项当场抓住了 —— 与上方 beat.json 同一条历史教训，我又犯了一遍。
@@ -761,7 +761,7 @@ def beat(job):
             d = {}
         d[str(job)] = time.time()
         try:
-            os.makedirs(os.path.dirname(BEAT_FILE), exist_ok=True)
+            os.makedirs(os.path.dirname(BEAT_FILE), mode=0o700, exist_ok=True)
         except Exception:
             pass
         # ⚠ 权限必须显式 0o600：裸 `open(..., "w")` 按 **umask** 创建（launchd 下

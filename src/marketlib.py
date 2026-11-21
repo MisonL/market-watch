@@ -1486,7 +1486,7 @@ def _atomic_write_json(path, obj, indent=None):
     d = os.path.dirname(path) or "."
     fd = tmp = None
     try:
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(d, mode=0o700, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".tmp.")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = None                      # 已交给 with 管理
@@ -1551,7 +1551,7 @@ def _open_lockfile(p):
     """
     _d = os.path.dirname(p)
     if _d:
-        os.makedirs(_d, exist_ok=True)
+        os.makedirs(_d, mode=0o700, exist_ok=True)
     return os.fdopen(
         os.open(p, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600),
         "a", encoding="utf-8")
@@ -1726,6 +1726,12 @@ def _host_dead(host, half_open=True):
     """
     try:
         d = _load_json(DEAD_HOST_FILE, {})
+        #2026-11-21: d could be a valid non-dict (old format / hand-edited list)
+        # -> d.get raises AttributeError, swallowed by except -> "host healthy"
+        # -> dead hosts keep burning3 retries per round, zero log. Same guard
+        # already exists in _reserve / dcache_set / _proxy_fail_get; missed here.
+        if not isinstance(d, dict):
+            d = {}
         ts = d.get(host, 0)
         # 必须守 isnum：坏数据（手工写字符串 ts）会让相减抛 TypeError，
         # 被下面的 except 吞成 False = "主机健康"，于是又去打死主机 3 次。

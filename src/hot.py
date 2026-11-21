@@ -441,7 +441,28 @@ _VR_BASE = _vr_load()
 # 默认路径（下一轮再试），比混入另一基点的序列好。
 # 若将来要恢复冗余，正确做法是**只取成交额列**并显式写明"不得用于
 # 任何跨日价格比率"，而不是直接换 URL。
-VR_HOSTS = ("https://push2test.eastmoney.com/api/qt",)
+# ⚠️⚠️2026-11-21（P0）：剔除"不可能存在的交易日"的K线。
+#
+#与 marketlib._kline_ohlc同一判据（那边只作用于 levels，本文件的量比/
+#涨幅路径当时没覆盖）。`[实测]`2026-11-21（周六）push2test给出
+#2026-11-21收2257.74的假根，单日 +19.3%、成交额仅3.04亿
+# （真实交易日约1600亿）——它会同时污染 ret63与5日均额 base,
+#而 base会写进 vr_base.json缓存**一整天**。
+def _drop_impossible_bars(rows):
+    _t = datetime.date.today()
+    _out = []
+    for r in rows:
+        _d = None
+        try: _d = datetime.date.fromisoformat(str(r[0])[:10])
+        except Exception: _d = None
+        if _d is None: continue
+        if _d > _t: continue
+        if not M.is_trading_day(_d, warn=False): continue
+        _out.append(r)
+    return _out
+
+
+VR_HOSTS = (M.EM_HIS_HTTP,)
 
 
 # 日内累计成交占比曲线（实测拟合，单位：分钟 -> 累计占比）
@@ -533,6 +554,7 @@ def kline_stats(code, today_amt, now=None, budget_s=None):
                 # 弃用，而逐条过滤还能救回其中正常的那些。
                 rows = [r.split(",") for r in _inner["klines"]
                         if isinstance(r, str)]
+                rows = _drop_impossible_bars(rows)
                 rows = [r for r in rows if r[0] != now.date().isoformat()]
                 for q in rows:
                     try: hist.append(float(q[6]))       # f57=成交额

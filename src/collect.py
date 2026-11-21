@@ -129,12 +129,36 @@ except Exception as _imp_e:
         # 故做一次最小截尾：超阈就丢掉前 40%。
         try:
             if os.path.getsize(_rn) > 4 * 1024 * 1024:
-                with open(_rn, "r+", encoding="utf-8", errors="replace") as _tf:
-                    _all = _tf.readlines()
-                    _keep = _all[len(_all) // 2:]
-                    _tf.seek(0)
-                    _tf.writelines(_keep)
-                    _tf.truncate()
+                #2026-11-21(P2): rewrite via tmp+replace, under the SAME lock runlog uses.
+                #The old in-place r+/seek0/writelines/truncate is an unlocked read-modify-
+                #write: if analyze appended a line meanwhile it gets wiped, and a kill mid-
+                #way leaves a half-rewritten file. What is lost is exactly the audit trail
+                #needed to diagnose the failure that brought us here. runlog.py already
+                #uses tmp+replace and notes that writelines is not atomic.
+                _lk = None
+                _fc2 = None
+                try:
+                    _lk = os.open(_rn + ".lock", os.O_CREAT | os.O_RDWR,0o600)
+                    _fc2 = __import__("fcntl")
+                    _fc2.flock(_lk, _fc2.LOCK_EX)
+                    with open(_rn, "r", encoding="utf-8", errors="replace") as _tf:
+                        _all = _tf.readlines()
+                    _keep = _all[len(_all) //2:]
+                    _tmp = _rn + ".tmp"
+                    with open(_tmp, "w", encoding="utf-8") as _wf:
+                        _wf.writelines(_keep)
+                        _wf.flush()
+                        os.fsync(_wf.fileno())
+                    os.replace(_tmp, _rn)
+                except Exception:
+                    try: os.unlink(_rn + ".tmp")
+                    except Exception: pass
+                finally:
+                    try:
+                        if _lk is not None and _fc2 is not None:
+                            _fc2.flock(_lk, _fc2.LOCK_UN)
+                            os.close(_lk)
+                    except Exception: pass
         except Exception:
             pass
         _fd_r = os.open(_rn,
@@ -430,8 +454,12 @@ def evaluate(q, sg, now):
         # 09:25~09:30 拿到的是上一交易日的全天值，写进 pending.json
         # 同样会占住 `fund_<code>` 去重键。
         if not _a_live_now: continue
-        f62 = x["f62"]/1e8 if M.isnum(x.get("f62")) else 0.0
-        ev.append({"k":f"fund_{c}","msg":f"{nm} 主力{f62:+.1f}亿 占比{x['f184']:+.1f}%",
+        _f62v = x.get("f62")
+        #2026-11-21: missing f62 must NOT become "主力+0.0亿" -- renders as
+        # "no money moved" while f184 on the same line may say "+9.2%".
+        f62 = _f62v/1e8 if M.isnum(_f62v) else None
+        _amt_s = ("主力未知" if f62 is None else f"主力{f62:+.1f}亿")
+        ev.append({"k":f"fund_{c}","msg":f"{nm} {_amt_s} 占比{x['f184']:+.1f}%",
                    "prio":"high"})
     # high 零值守卫：停牌/集合竞价前 trends2 返回全 0 序列，high==0 可达
     # ⚠️ `sg["last"]` / `sg["open"]` 原先**没有守卫**，只有 high 有。
@@ -537,6 +565,14 @@ def _as_news_list(v: object) -> list[Any]:
     return v if isinstance(v, list) else []
 
 
+#ⓘ取 pending.json锁最多等多久（秒）。
+#120s而不是5s：单个 collect持锁期间会做 news网络请求；实测4个进程竞争时
+#5s会有人放弃锁，而"锁失败就返 None（开锁）"的语义会让它**无锁写入**，
+#从而丢 hist（并发用例实测只剩2/4）。120s远小于300s调度周期，
+#既不会永久挂死，也明显高于正常持锁时长。
+_PENDING_LOCK_WAIT =120
+
+
 def _pending_lock(path):
     """对 `pending.json` 取排他锁，返回 fd（失败返 None）。
 
@@ -549,9 +585,25 @@ def _pending_lock(path):
     """
     try:
         import fcntl as _fc
-        _fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
-        _fc.flock(_fd, _fc.LOCK_EX)
-        return _fd
+        _fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR,0o600)
+        #2026-11-21(P0): a blocking flock NEVER fails -- it just waits forever.
+        #The docstring said "return None on failure", but with LOCK_EX that
+        #branch was unreachable. If the holder stalls in _news() (network) or
+        #fsync (disk full), the next collect hangs forever; launchd stacks one
+        #every300s, pending.json stops updating, analyze sees stale and drops
+        #the whole intraday section -- while selfcheck blames "collector down".
+        #Same fix already applied to analyze.save_st (5s deadline).
+        _dl = time.monotonic() + _PENDING_LOCK_WAIT
+        while True:
+            try:
+                _fc.flock(_fd, _fc.LOCK_EX | _fc.LOCK_NB)
+                return _fd
+            except OSError:
+                if time.monotonic() >= _dl:
+                    try: os.close(_fd)
+                    except Exception: pass
+                    return None
+                time.sleep(0.2)
     except Exception:
         return None
 
