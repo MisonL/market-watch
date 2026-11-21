@@ -4631,6 +4631,18 @@ MUTANTS = [
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
 
+    # --- 实时行情禁用测试源（2026-11-21，P0 数据正确性）---
+    # EM 被封只剩 push2test 通时，quotes() 返回伪造行情（3701.71 vs 真值 3533.79），
+    # 三大指数全错。`_valid_quotes()` 与新鲜度闸门都拦不住。
+    ("quote-source-trust-emtest",
+     "marketlib.py",
+     '    em_hosts = [h for h in _ordered_em_hosts()\n'
+     '                if _host_of(h) != _host_of(EM_TEST)]',
+     '    em_hosts = _ordered_em_hosts()   # 注入：恢复旧行为',
+     "[行情源可信度] 实时行情候选池又含 push2test → EM 真主机被封时"
+     "会把测试环境的模拟行情当成真行情推给用户",
+     "采用了 push2test 的伪造行情"),
+
     # --- 兜底链超时钳制（2026-11-21，P1）---
     # 11:42 直连超时后白烧 firecrawl 90s，整轮 300s、AI 一分钱没拿到。
     ("data-fallback-timeout-unclamped",

@@ -1094,6 +1094,9 @@ def _snap_stubs():
                                     # proxy_json 原本就在名单，firecrawl_json
                                     # 属"新增桩忘记登记"（由 [桩泄漏] 抓出）。
                                     "firecrawl_json",
+                                    # [行情源可信度] 要把 push2test 排到首位来
+                                    # 验证"它给的数据不会被采用"，故替换排序函数。
+                                    "_ordered_em_hosts",
                                     # 同段还桩了 data_expired 的取值来源
                                     # （通过 set_data_deadline，已含在下面
                                     # 的还原里，不单列为桩）。
@@ -12233,6 +12236,71 @@ def _main(ok_all):
             ok_all = False
         else:
             print("  ✅ 孤儿段头连根删、引用块正文不误伤、行内占位不动")
+    except Exception as e:
+        _unverified[0] += 1
+        print(f"  ❌ {e}"); ok_all = False
+
+    # 14e-4b) 实时行情**绝不能**来自 push2test（测试源给伪造行情）。
+    #
+    # `[实测]` 2026-11-21 EM 三台主机被出口 IP 封禁、只剩 push2test 通：
+    #   push2test 直连 f2=3701.71 f3=+4.75（伪造）
+    #   push2 经 firecrawl f2=3533.79 f3=-1.23（与腾讯/新浪逐位一致）
+    #   quotes() 实际返回 3693.14/4221.32/2475.58 —— 三大指数全错。
+    # `_valid_quotes()` 拦不住（有限正数），新鲜度闸门也拦不住（时间戳新）。
+    # 本文件 2643 行早写过「A股指数 EM_TEST 的日K 损坏」，但那条结论只落到
+    # 日K 路径，实时行情一直沿用"两台等价"的旧假设 —— 于是留下这个洞。
+    print("\n[行情源可信度]")
+    try:
+        import marketlib as _M8q
+        _badq = 0
+        _tst = _M8q._host_of(_M8q.EM_TEST)
+        # ① clist 仍须能用它（删了板块会失明）
+        if _tst not in [_M8q._host_of(h) for h in _M8q.EM_HOSTS]:
+            _badq += 1
+            print(f"  ❌ EM_HOSTS 缺 {_tst} —— clist 只有它能取，"
+                  f"删了板块会整段失明")
+        # ② quotes() 候选池必须剔除它（行为级：让它返回伪造值，看是否被采用）
+        _fq = {"f2": 9999.9, "f3": 88.88}
+        _seenq = []
+        _svq = (_M8q._fetch, _M8q._ordered_em_hosts,
+                _M8q._hk_quotes_via_tencent, _M8q.log,
+                _M8q._daily_log_once)
+        import feeds as _fdq
+        _svq_bk = _fdq.backup_quotes
+        try:
+            def _fakeq(host, ids, fields):
+                if _M8q._host_of(host) == _tst:
+                    _seenq.append(_M8q._host_of(host))
+                    return {i: dict(_fq) for i in ids}
+                return {}
+            _M8q._fetch = _fakeq
+            _M8q._ordered_em_hosts = lambda: [_M8q.EM, _M8q.EM_TEST]
+            _M8q._hk_quotes_via_tencent = lambda s: {}
+            _M8q.log = lambda m, lv=None: None
+            _M8q._daily_log_once = lambda *a, **k: None
+            _fdq.backup_quotes = lambda codes: {}
+            _M8q.set_data_deadline(None)
+            _outq = _M8q.quotes(["1.000001"])
+            if _fq["f2"] in [v.get("f2") for v in (_outq or {}).values()]:
+                _badq += 1
+                print(f"  ❌ quotes() 采用了 push2test 的伪造行情 "
+                      f"{_fq['f2']} —— 该源是测试环境（实测 3701.71 vs 真值"
+                      f" 3533.79），假数据会直接推给用户")
+            if _seenq:
+                _badq += 1
+                print(f"  ❌ quotes() 仍向 push2test 发起实时行情请求 —— "
+                      f"白打一个必然给出假数据的包")
+        finally:
+            (_M8q._fetch, _M8q._ordered_em_hosts,
+             _M8q._hk_quotes_via_tencent, _M8q.log,
+             _M8q._daily_log_once) = _svq
+            _fdq.backup_quotes = _svq_bk
+            _M8q.set_data_deadline(None)
+        if _badq:
+            print(f"  ❌ {_badq} 项行情源可信度判据不成立")
+            ok_all = False
+        else:
+            print("  ✅ 实时行情不使用 push2test（伪造源），clist 仍保留它")
     except Exception as e:
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
