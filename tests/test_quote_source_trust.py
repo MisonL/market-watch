@@ -165,4 +165,41 @@ finally:
     M._daily_log_once = _sv4["dlo"]
     M.set_data_deadline(None)
 
-print(f"ALL PASS (实时行情/板块列表禁用测试源 push2test {_ok[0]} 个断言)")
+
+# ---------- ⑤ 板块日K 同样不得来自 push2test ----------
+#
+# 2026-11-21 逐根对账（90.BK1137 存储芯片）：
+#
+#     日期        push2test（假）   push2his（真）
+#     2026-11-19  2025.48          2142.85
+#     2026-11-20  1892.10          2001.74   ← 与实时 f2 逐位一致
+#     2026-11-21  2217.80          不存在（周六，合成盘自走了一根）
+#
+# 也就是说：板块【关键位】（20/60 日高低）此前一直用假序列算。
+# 它"看起来干净"（0 跳变）恰恰因为整条是**平滑的合成盘** —— 既有跳变校验
+# 天然抓不到，这是个只看"稳不稳"永远发现不了的缺陷。
+_urls5 = []
+_sv5 = {"cj": M.cj, "log": M.log, "dcg": M.dcache_get}
+try:
+    def _cj5(url, **k):
+        _urls5.append(url)
+        return None
+    M.cj = _cj5
+    M.log = lambda m, lv=None: None
+    M.dcache_get = lambda key: None
+    M.set_data_deadline(None)
+    M._kline_ohlc("90.BK1137")
+finally:
+    M.cj = _sv5["cj"]
+    M.log = _sv5["log"]
+    M.dcache_get = _sv5["dcg"]
+    M.set_data_deadline(None)
+
+check(_urls5, "板块日K 没有发起任何请求 —— 判据无法验证")
+check(not any("push2test" in u for u in _urls5),
+      f"板块日K 仍向 push2test 取数（{_urls5[:1]}）—— 那台是合成盘，"
+      f"会把 20/60 日高低算错，且 0 跳变使它永不报警")
+check(any("push2his" in u for u in _urls5),
+      f"板块日K 没有走 push2his（实测唯一能给出真序列的主机）：{_urls5[:1]}")
+
+print(f"ALL PASS (实时行情/板块列表/板块日K 禁用 push2test {_ok[0]} 个断言)")

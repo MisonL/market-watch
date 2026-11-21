@@ -4635,6 +4635,17 @@ MUTANTS = [
      "[AI 输出] 预算秒数正则必须认 float（生产 marker 是 196.0s）",
      "196s"),
 
+    # --- 板块日K 也不得用测试源（2026-11-21，P0）---
+    # EM_TEST 的板块日K 是平滑合成盘：11-20 收 1892.10 vs 真值 2001.74，
+    # 于是 20/60 日高低一直是假序列算的，且"0 跳变"使它永不报警。
+    ("kline-source-trust-emtest",
+     "marketlib.py",
+     '            d = cj(f"{EM_HIS_HTTP}/stock/kline/get?secid={secid}"',
+     '            d = cj(f"{EM_TEST}/stock/kline/get?secid={secid}"   # 注入',
+     "[行情源可信度] 板块日K 走回 push2test → 关键位用合成序列算，"
+     "20/60 日高低全错且不报警",
+     "板块日K 仍向"),
+
     # --- clist 也不得用测试源（2026-11-21，P0）---
     # 「关注板块/板块资金/热点」每个数字都来自 clist；push2test 的模拟盘
     # 实测同一板块 f62 差 30 倍（-3316 万 vs -9.8 亿）。

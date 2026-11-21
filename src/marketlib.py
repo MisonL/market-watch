@@ -561,6 +561,21 @@ def claude_bin():
     # "源坏了"的错误印象）。
     # 修法：失败时**重试 6 次 × 1s**（与 selfcheck 的 [AI 通道] 段同一判据），
     # 仍失败才记 CFG 日志并返回空。重试只在失败时付代价，正常路径零开销。
+    # ⚠️⚠️ 2026-11-21（CI 假绿的教训）：`MW_NO_CLAUDE_CLI=1` 时**直接判"没有 CLI"**。
+    #
+    # 存在理由不是给生产用的开关，而是**让本地能复现 CI 环境**：
+    # `[实测]` 2026-11-21 起连续 5 次 push 的 GitHub Actions 全红，而本地
+    # `run_all` 一直 56/56 全绿。差别只有一处 —— **CI 的 ubuntu 上没装
+    # claude CLI**，于是 `ai_analyze()` 还没走到 `_invoke` 就 `return`，
+    # 留痕日志当然一条不出。本地装了 CLI，所以永远复现不出来。
+    #
+    # 有了这个开关，`tests/run_all.sh` 可以跑一遍"没有 CLI"的整套测试，
+    # 任何**依赖本机 CLI 存在**的用例会当场变红 —— 把一个只在远端出现的
+    # 环境差异，变成本地一秒就能验的前置条件。
+    # 与 `MW_NO_LOCK` / `MW_SKIP_AI_PROBE` 同族：都是"让测试能在受控环境下
+    # 断言真实行为"的钩子，不影响任何调用方的正常路径。
+    if os.environ.get("MW_NO_CLAUDE_CLI") == "1":
+        return (None, None)
     for _attempt in range(CLI_PROBE_ATTEMPTS + 1):   # 1 次首探 + CLI_PROBE_ATTEMPTS 次重试
         if _attempt:
             time.sleep(CLI_PROBE_DELAY)
@@ -2643,11 +2658,20 @@ def _fallback_get(url, ref=None, host=None, timeout=20):
 #   A股指数   EM_TEST 的日K**损坏** —— 上证 61 根里 14 根单日跳变 >15%，
 #             高点在 3828~9282 之间乱跳（沪深300 13 根、科创50 18 根）。
 #             用它算"20日高"会得出"距高 -45%"这种荒谬结论。腾讯完全干净。
-#   板块 90.BKxxxx  腾讯无此接口；EM_TEST 干净（0 跳变）。
+#   板块 90.BKxxxx  腾讯无此接口。⚠️⚠️ 2026-11-21 更正：**EM_TEST 同样不可信**，
+#             只是它"看起来干净"—— 0 跳变恰恰因为整条序列是**平滑的合成盘**。
+#             `[实测]` 同一标的 90.BK1137 存储芯片，与真主机逐根对账：
+#                 日期         EM_TEST（假）      push2his（真）
+#                 2026-11-19   2025.48            2142.85
+#                 2026-11-20   1892.10            2001.74  ← 与实时 f2 完全一致
+#                 2026-11-21   2217.80            不存在（周六，合成盘自走了一根）
+#             换句话说：板块【关键位】此前一直是用假序列算出来的 20/60 日高低。
+#             真值来源是 `push2his` 的**明文 HTTP**（HTTPS 无数据、push2 HTTP 无
+#             数据，实测 2026-11-21）。
 #   港股      EM_TEST 口径错误（恒指 25737 vs 真值 24700，与此前发现的
 #             f2/f3 问题同源）；腾讯干净且是权威源。
 #
-# 故按类型分流：A股指数/港股 → 腾讯，板块 → EM_TEST。
+# 故按类型分流：A股指数/港股 → 腾讯，板块 → `EM_HIS_HTTP`（push2his 明文 HTTP）。
 # 所有取回的序列都过一遍跳变校验，异常即判定该源不可信并丢弃。
 _TX_KLINE_URL = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
                  "?param={code},day,,,{n},qfq")
@@ -2812,7 +2836,13 @@ def _kline_ohlc(secid, n=61):
             #     **显式消失**，读者知道"这项没有"，比给一个偏 1.4pp 的数好。
             # 若将来要加兜底，必须同时把 cur 也取自同一条序列（或把两边
             # 基点对齐），否则不要加。
-            d = cj(f"{EM_TEST}/stock/kline/get?secid={secid}"
+            # ⚠️ 2026-11-21（P0）：**不得再用 EM_TEST 取日K** —— 实测其序列是
+            # 平滑的合成盘（11-20 收 1892.10，真值 2001.74），于是板块关键位
+            # （20/60 日高低）一直是假数据算的，且因为"没有跳变"从不报警。
+            # 真值只在 `EM_HIS_HTTP`（push2his 明文 HTTP）上：HTTPS 无数据、
+            # push2 HTTP 无数据，均实测确认。取不到时返回 None，
+            # 关键位段显式消失（"宁可缺数据，不给错的数"）。
+            d = cj(f"{EM_HIS_HTTP}/stock/kline/get?secid={secid}"
                    f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56"
                    f"&klt=101&fqt=1&end=20500101&lmt={_n2}&ut={UT}")
             kl = ((d or {}).get("data") or {}).get("klines") or []

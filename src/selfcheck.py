@@ -12339,12 +12339,41 @@ def _main(ok_all):
             finally:
                 (_M8q.cj, _M8q.log, _M8q._daily_log_once) = _svq2
                 _M8q.set_data_deadline(None)
+        # ④ 板块日K 也不得来自 push2test —— 它"看起来干净"（0 跳变）恰恰
+        #    因为整条是平滑的**合成盘**：BK1137 的 11-20 收 1892.10，
+        #    而真主机 push2his 是 2001.74（与实时 f2 逐位一致）。
+        #    于是板块关键位（20/60 日高低）此前一直用假序列算。
+        _urls_k = []
+        _svk = (_M8q.cj, _M8q.log, _M8q.dcache_get)
+        try:
+            def _cjk(url, **k):
+                _urls_k.append(url)
+                return None
+            _M8q.cj = _cjk
+            _M8q.log = lambda m, lv=None: None
+            _M8q.dcache_get = lambda key: None
+            _M8q.set_data_deadline(None)
+            _M8q._kline_ohlc("90.BK1137")
+        finally:
+            (_M8q.cj, _M8q.log, _M8q.dcache_get) = _svk
+            _M8q.set_data_deadline(None)
+        if not _urls_k:
+            _badq += 1
+            print("  ❌ 板块日K 未发起任何请求 —— 判据无法验证")
+        elif any(_tst in _u for _u in _urls_k):
+            _badq += 1
+            print(f"  ❌ 板块日K 仍向 {_tst} 取数 —— 合成盘会把 20/60 日高低"
+                  f"算错（实测 1892.10 vs 真值 2001.74），且 0 跳变不报警")
+        elif not any("push2his" in _u for _u in _urls_k):
+            _badq += 1
+            print(f"  ❌ 板块日K 没走 push2his（实测唯一能给真序列的主机）："
+                  f"{_urls_k[:1]}")
         if _badq:
             print(f"  ❌ {_badq} 项行情源可信度判据不成立")
             ok_all = False
         else:
-            print("  ✅ 实时行情与板块列表（clist/trends2）均不使用 push2test"
-                  "（测试环境的模拟盘）")
+            print("  ✅ 实时行情 / 板块列表(clist) / 板块日K 三处均不使用"
+                  " push2test（测试环境的合成盘）")
     except Exception as e:
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
