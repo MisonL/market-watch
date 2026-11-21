@@ -187,6 +187,11 @@ HOLIDAYS = {
 # 节假日表的覆盖上限。超过此日期说明表已过期，is_trading_day 会
 # **保守地按周末规则判断**并写一条告警 —— 宁可漏判一个休市日
 # （空跑一轮，无害），也不要静默地把休市日当交易日。
+# ⚠️⚠️2026-11-21（P2）：**告警方向反了**。原先只在 d>覆盖上限时才告警，
+#而2027整段在本文件里自注「预填/推断、须官方核对」——于是最不可信的
+#那一年一条告警都没有，等2028-01-01才开始报，那时错误已经影响整整一年。
+#改法：另设「须人工核对」的分界，进入未核对的年份**之前**就提醒。
+HOLIDAYS_VERIFY_BY = "2026-12-31"
 HOLIDAYS_COVERED_THROUGH = "2027-12-31"
 # ⚠️ 原先是**进程内**一次性标志，但 analyze/collect 每轮各起一个**新进程**
 # —— 过期后每天约 430 条相同告警，而 watch.log 只有 2MB 单代轮转，
@@ -3030,6 +3035,14 @@ def levels(secid):
     """
     key = f"levels:{secid}"
     hit = dcache_get(key)
+    # ⚠️2026-11-21（P3）：缓存**读出必须验形状**。dcache是磁盘JSON，
+    #可能被旧版本格式/手工编辑/半截写入污染；命中即返回的话，
+    #analyze那边 lv["cur"]会在字符串上抛 TypeError，关键位段整段消失，
+    #而"lv为空"的守卫挡不住非空字符串。形状不对就当未命中、重算一次。
+    if hit is not None and not (
+        isinstance(hit, dict) and "cur" in hit) and hit != "__none__":
+        log(f"关键位缓存形状异常（{type(hit).__name__}），已忽略并重算", "CACHE")
+        hit = None
     if hit is not None:
         if hit != "__none__":
             return hit
@@ -3194,7 +3207,14 @@ class RateLimiter:
                     return False
                 base += 1
                 # 保留 warned_tier（跨进程去重用），不能被本次计数覆盖掉
-                _keep_tier = cur.get("warned_tier")
+                #2026-11-21（P1）：**跨日必须重置 tier**，不能无条件继承。
+                #原写法只把 count按日期归零，warned_tier却照抄前一天的值 ——
+                #于是新的一天 count从1开始，pct//10最大才3，永远不大于残留的9，
+                #80%/90%「接近上限」预警**从第二天起永久失效**，只剩耗尽后一句马后炮。
+                # [实测]线上 rate.json = {"date":今天,"count":718,"warned_tier":9}：
+                #718次只到35%，tier9必是前一日残留 ——这条缺陷已经在线上生效。
+                _same_day = (cur.get("date") == self.day)
+                _keep_tier = cur.get("warned_tier") if _same_day else None
                 _rec = {"date": self.day, "count": base}
                 if isnum(_keep_tier):
                     _rec["warned_tier"] = int(_keep_tier)
@@ -3858,8 +3878,29 @@ def _valid_quotes(o, min_ratio=0.5):
     #   f2=0 后在 push 里渲染成「科创50 +0.00%」这种看着正常、其实是没数据的
     #   数字（analyze 的 isnum 守卫只挡 "-"，挡不住 0）。
     # 剔除后键消失，备用源补齐自然接管。
-    bad = [k for k, v in o.items()
-           if not (isinstance(v, dict) and isnum(v.get("f2")) and v["f2"] > 0)]
+    #2026-11-21（P1）：**只验 f2不够**。原判据是
+    # `isnum(v.get("f2")) and v["f2"] >0` —— f3、量级、与 f2内部一致性全不验。
+    # [实测]喂 {"f2":3533.79,"f3":60.64}与 {"f2":999999.0}都原样返回。
+    #后果：源字段漂移时 f2合法而 f3错位的行会过闸门，
+    # alert.check_index拿 f3算3σ ->群里推「上证 +60%」这种假异动；
+    # f2=999999这种明显荒谬的点位也会进快照与推送。
+    #判据（宁可剔掉让备用源补齐，也不让错数进链路）：
+    #① f2必须是有限正数（原有）；
+    #② f3（涨跌幅%）若给出，必须在 ±25%内 —— A股/指数单日不可能超此；
+    #③ f2不能是荒谬量级（>1e7，指数与个股都远低于此）。
+    _F3_MAX =25.0
+    _F2_MAX =200000.0
+    def _row_ok(_v):
+        if not (isinstance(_v, dict) and isnum(_v.get("f2"))):
+            return False
+        if not (_v["f2"] >0 and _v["f2"] < _F2_MAX):
+            return False
+        _f3 = _v.get("f3")
+        if _f3 is not None and (not isnum(_f3) or abs(_f3) > _F3_MAX):
+            return False
+        return True
+
+    bad = [k for k, v in o.items() if not _row_ok(v)]
     for k in bad:
         del o[k]
     if not o or len(bad) / (len(o) + len(bad)) > (1 - min_ratio):
@@ -4987,15 +5028,31 @@ def is_trading_day(d=None, warn=True):
     # ⚠️ `warn=False` 供**只读调用方**（webui 面板）使用：否则 2027-12-31 之后
     # 打开一次面板就会写 cache/holiday_warn.json + 往 watch.log 插一行，
     # 破坏"面板只读"契约（2026-10-08 审查）。
-    if warn and d.isoformat() > HOLIDAYS_COVERED_THROUGH:
+    #2026-11-21（P2）：两档告警。
+    #①已进入"表里未核对"的年份 ->提前提醒去核对官方安排；
+    #②已彻底超过覆盖上限 ->按周末规则保守判断。
+    #原先只判② ——于是最不可信的那一年（2027，本文件自注"须官方核对"），
+    #反而一条告警都没有，等表彻底用完才报，错误已影响整整一年。
+    _dstr = d.isoformat()
+    _expired = _dstr > HOLIDAYS_COVERED_THROUGH
+    _unverified = (not _expired) and (_dstr > HOLIDAYS_VERIFY_BY)
+    if warn and (_expired or _unverified):
         try:
             _today = datetime.date.today().isoformat()
             _w = _load_json(_HOLIDAY_WARN_FILE, {}) or {}
-            if _w.get("last") != _today:
+            #按"档位"去重：两档各能提醒一次，不会被前一档吃掉。
+            _tier = "expired" if _expired else "unverified"
+            if _w.get("last") != _today or _w.get("tier") != _tier:
                 _w["last"] = _today
+                _w["tier"] = _tier
                 _atomic_write_json(_HOLIDAY_WARN_FILE, _w)
-                log(f"节假日表已过期（仅覆盖至 {HOLIDAYS_COVERED_THROUGH}），"
-                    f"请更新 marketlib.HOLIDAYS —— 否则休市日会被当作交易日", "CFG")
+                if _expired:
+                    log(f"节假日表已过期（仅覆盖至 {HOLIDAYS_COVERED_THROUGH}），"
+                        f"请更新 marketlib.HOLIDAYS ——否则休市日会被当作交易日", "CFG")
+                else:
+                    log(f"节假日表已进入未核对区间（{HOLIDAYS_VERIFY_BY}之后的段是"
+                        f"预填/推断值），请按官方安排核对 HOLIDAYS ——写错会把休市日"
+                        f"当交易日，或反之", "CFG")
         except Exception:
             pass
     return d.weekday() < 5 and d.isoformat() not in HOLIDAYS

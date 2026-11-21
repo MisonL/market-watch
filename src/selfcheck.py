@@ -12465,6 +12465,40 @@ def _main(ok_all):
     #feeds.health /热点量比又漏网。每次都只修"当前知道的消费方"，于是下一个
     #继续拿假数据。现在只有一个安全入口 `_ordered_real_em_hosts()`，这里用
     #AST静态扫描保证没人绕过它 ——新增消费方当场变红，而不是等用户看到假数据。
+    print("\n[拆行终止性]")
+    #2026-11-21（P0）：`_split_wall_lines`曾在**首行正好88字**时无限循环。
+    #成因是进度归零：首行填满后 _left=0 -> _cut=0 -> _p长度不变。
+    #后果是 analyze进程挂死、watch.lock不释放，当天后续推送全没。
+    #这里带**硬超时**跑一遍边界宽度：没有超时保护的话，自检自己会挂住。
+    try:
+        import signal as _sig4s
+        import analyze as _A4s
+        def _al4s(*_a):
+            raise TimeoutError(">3s")
+        _sig4s.signal(_sig4s.SIGALRM, _al4s)
+        _bad4s = []
+        for _w4s in (86,87,88,89,90):
+            _txt = "**盘面**" + "甲" *(_w4s -10) + "；" + "乙" *90
+            _sig4s.alarm(3)
+            try:
+                _out4s = _A4s._split_wall_lines(_txt)
+            except TimeoutError:
+                _bad4s.append(f"首段{_w4s}字 ->超过3秒未返回（死循环回归）")
+                continue
+            finally:
+                _sig4s.alarm(0)
+            _mx = max(len(_x) for _x in _out4s.split("\n"))
+            if _mx > _A4s._SPLIT_LIMIT:
+                _bad4s.append(f"首段{_w4s}字 ->出现{_mx}字超宽行")
+        if _bad4s:
+            print(f" ❌ {len(_bad4s)}种边界宽度拆行异常：{_bad4s[:3]}")
+            ok_all = False
+        else:
+            print(" ✅拆行在首段86~90字边界处均能终止，且每行不超阈值")
+    except Exception as _e4s:
+        _unverified[0] +=1
+        print(f" ❌ {_e4s}"); ok_all = False
+    
     print("\n[实时取数真值收口]")
     #hot的量比/63日涨幅取数主机同样不得含测试源 ——它不在 `_ordered_*`
     #体系里，是自己维护的 VR_HOSTS元组。假源会同时污染量比基准(5日均额)

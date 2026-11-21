@@ -129,4 +129,34 @@ _ML = open(os.path.join(ROOT, "src", "marketlib.py"), encoding="utf-8").read()
 check("os.makedirs(d, mode=0o700" in _ML, "marketlib建state目录没传mode=0o700——裸makedirs会建出0755与自检判据冲突")
 check("if not isinstance(d, dict):" in _ML, "_host_dead对非dict形态没isinstance守卫——AttributeError被吞成「主机健康」")
 
-print("ALL PASS (审计8项修复的行为回归21个断言)")
+
+# ----------9. curl rc=28（自身超时）必须算「结果未知」，不得回滚去重键 ----------
+#2026-11-21(P1)：push()的 argv带 --max-time15、subprocess超时是20s,
+#所以 curl会先自己退出并返回 rc=28，那个 except TimeoutExpired分支
+#**永远走不到**。原实现在 rc=28时按普通失败处理 ->上层回滚去重键
+# ->5分钟后同一条消息再发一遍（群里看到两条几乎一样的推送）。
+class _FakeCP:
+    returncode =28
+    stdout = ""
+    stderr = "Operation timed out"
+_sv_run = A.subprocess.run
+_sv_hook = dict(A.CFG) if isinstance(A.CFG, dict) else None
+_sv_rl = A._rl
+class _FakeRL:
+    def push(self, *a, **k):
+        return None
+A.subprocess.run = lambda *a, **k: _FakeCP()
+A._rl = _FakeRL()
+if isinstance(A.CFG, dict):
+    A.CFG["webhook"] = "https://example.invalid/hook?key=x"
+_r28 = A.push("测试正文" *20, slot="10:00", kind="push")
+check(_r28 is False, "rc=28时 push()应返回 False（确实不知道成不成）")
+check(A._PUSH_OUTCOME_UNKNOWN is True,
+ "curl rc=28没有标记「投递结果未知」——上层会回滚去重键，"
+ "下一轮把同一条消息再推一遍")
+A.subprocess.run = _sv_run
+A._rl = _sv_rl
+A._PUSH_OUTCOME_UNKNOWN = False
+if _sv_hook is not None: A.CFG = _sv_hook
+
+print("ALL PASS (审计8项修复的行为回归23个断言)")

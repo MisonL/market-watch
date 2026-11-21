@@ -1585,6 +1585,20 @@ def push(t, slot=None, kind="push"):
     # ⚠️ 2026-11-05（P1）：curl rc/stderr 留痕。原先只看 stdout 里的
     # errcode，curl 自身失败（DNS 解析失败、连接被拒、TLS 错误）时 stdout
     # 为空、stderr 有原因，却不落任何日志 —— 排查时只知道"PUSH FAIL"。
+    # ⚠️⚠️2026-11-21（P1）：rc=28（curl自身超时）必须走「结果未知」。
+    #
+    #上面那个 except subprocess.TimeoutExpired分支写得没错，但它**不可达**：
+    #argv带 --max-time15，而 subprocess.run(timeout=20) —— curl会先在15s
+    #处自己退出并返回 rc=28，Python根本等不到20s的 TimeoutExpired。
+    #于是「服务端已收到、但我们没等到响应」落到这里被当成普通失败
+    # →上层回滚去重键 →5分钟后同一条消息再发一遍。
+    #已在上面 except分支声明过（函数作用域），此处不能重复声明。
+    if r.returncode ==28:
+        _PUSH_OUTCOME_UNKNOWN = True
+        _log(f"PUSH curl rc=28（--max-time超时，投递结果未知 —— "
+            f"保留去重键，不重推） :: {t[:40]!r}")
+        _rl.push(slot, kind, _fin(t), False, note="curl rc=28（结果未知）")
+        return False
     if r.returncode != 0 or r.stderr.strip():
         _log(f"PUSH curl rc={r.returncode} "
              f"stderr={r.stderr.strip()[:160]!r}")
@@ -1691,7 +1705,8 @@ SLOTS = {
             "②哪条判断被验证了、哪条被证伪；③尾盘最后几分钟盯什么。"
             "这条是当日倒数第二条（15:00 还有收盘定局），"
             "所以重点在「定调」而非「罗列数据」。"
-            "**不给提交/确认类表述**（15:00 已过操作窗口）。"),
+            "**不给提交/确认类表述**（本时段在15:00**之前**，是14:45~14:58的收盘前汇总 ——不要写成"
+            "「操作窗口已过」「今天不能再提交」，那与15:00截止的场外基金申赎事实相反）。"),
  },
  # deadline 是**计划窗口最后一日**的提醒，时间刚性且不可补做
  # （次日已是新窗口）。它是本系统最不该丢、也最不该被稀释的一条。
@@ -2887,6 +2902,25 @@ def build_brief(q, sg, hits, now, hot=None, slot=None):
                      + ("。" if _gap <= 4 else "，其间为休市期。")
                      + " —— 紧迫程度以内部文档的措辞为准，本行只是日历事实。")
 
+    # ⚠️2026-11-21（P2）：「明日」必须落到**下一个交易日**，不能想当然。
+    #15:00与 summary两个时段的 rule都写「并给出明日展望 /明日怎么应对」，
+    #而此前只有 deadline分支注入日历事实 ——于是周五那条收盘定局让读者
+    #按「明日」准备预案，实际下一次开盘是周一；节前更甚（长假）。
+    #这里只提供日历事实，措辞不自作主张。
+    if slot in ("15:00", "summary"):
+        _d1 = now.date()
+        _nx1 = None
+        for _i1 in range(1,31):
+            _c1 = _d1 + datetime.timedelta(days=_i1)
+            if M.is_trading_day(_c1):
+                _nx1 = _c1
+                break
+        if _nx1 and _nx1 != _d1 + datetime.timedelta(days=1):
+            L.append(f" [日期提示]明天不是交易日；下一个交易日是 "
+                f"{_nx1:%m-%d}（周{_nx1.isoweekday()}）。"
+                f"正文若提到「明日/明天」，指的必须是这一天，不能写成明天。")
+        elif _nx1:
+            L.append(f" [日期提示]下一个交易日是 {_nx1:%m-%d}（明天）。")
     # 量能对比：今日成交额 vs 昨日。数据来自**已有的**日K请求（_kline_ohlc
     # 第 4 项就是成交量），零额外请求 —— 但它是「盘面」段判断"放量/缩量"的
     # 唯一依据。原先 brief 里只有当日成交额，AI 无从对比，只能写"成交 7511 亿"
@@ -6764,6 +6798,18 @@ def _split_wall_lines(t):
         _left = _first_left                   # 当前这行还能放多少正文
         for _p in _pieces:
             while len(_p) > _left:
+                # ⚠️⚠️2026-11-21（P0）：**必须保证每轮都有进展**。
+                #首行填满到正好 _LIMIT时，循环底部算出的 `_left`是0,
+                #于是 `_cut = _left =0` -> `_p = _p[0:]`长度不变 -> **死循环**。
+                # `[实测]`首行正好88字时 analyze直接挂死：进程不退出、
+                # watch.lock不释放，launchd每300s起的新轮全被挡 ->当天推送全没。
+                #先把已满的行落地，再按续行宽度继续；这样 _left必 >0。
+                if _cur != _head and len(_cur) >= _LIMIT:
+                    _rows.append(_cur)
+                    _cur = " "
+                    _left = _cont_left
+                if _left <=0:
+                    _left = max(1, _cont_left)
                 # 优先在「、」「，」处断 —— 那是最自然的停顿。
                 # ⚠️ `[实测]` 第一版只找「、」，遇到"整句无顿号、只有逗号"
                 # 的段（盘面常见）就走到硬切，于是把「资金」劈成「资」+「金」。
@@ -6786,6 +6832,9 @@ def _split_wall_lines(t):
                     _left = _cont_left
                 else:
                     _cur += _p[:_cut]
+                #兜底：_cut仍为0时强制切1个字，绝不留下零进度的一轮
+                if _cut <=0:
+                    _cut =1
                 _p = _p[_cut:]
             if len(_cur) + len(_p) > _LIMIT and _cur != _head:
                 _rows.append(_cur)

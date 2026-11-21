@@ -79,7 +79,10 @@ PORT = int(os.environ.get("MW_PORT", "8787"))
 # 改为**拒绝启动**：要对外提供，请先加鉴权，而不是改一个环境变量。
 def _is_loopback(h):
     _h = (h or "").strip().lower()
-    if _h in ("localhost", "::1", ""):
+        #2026-11-21（P2安全）：**空串不是回环**。原判据把空串也当回环，
+        #于是 MW_HOST=""绕过下面的"拒绝启动"守卫，直接 bind到0.0.0.0 ——
+        #一个环境变量就把零鉴权面板挂到所有网卡（_is_loopback("")实测 True）。
+    if _h in ("localhost", "::1"):
         return True
     return _h.startswith("127.")
 
@@ -920,7 +923,14 @@ def collect_health():
     except Exception:
         _is_td = now.weekday() < 5
     in_sess = _is_td and (_s0 <= hm <= _s1 + 5) and not (_l0 + 5 <= hm < _l1)
-    limit = _collect_fresh_limit() if in_sess else 3600
+    # ⚠️⚠️2026-11-21（P1）：**非交易时段不得判停摆**。
+    #原写法给非交易时段3600s上限，于是每个交易日16:05之后、以及整个
+    #周末，面板都红字「采集疑似停摆」（实测周六21:54: last=周五15:05、
+    # age=110720s、stale=True）。
+    #selfcheck里明写这种判法要排除（隔夜18小时每天都会报假红），
+    #本函数却自称阈值与 selfcheck同源 ——判据在 selfcheck里，没在这里。
+    #非交易时段本来就不采集：不设时间上限，stale恒 False。
+    limit = _collect_fresh_limit() if in_sess else int(1e9)
     _hist = p.get("hist")
     _evs = p.get("events")
     _nws = p.get("news")
@@ -1874,6 +1884,10 @@ def build_slots(date=None):
 
 
 def _slot_window_grace(key):
+    #2026-11-21（P2）：这里必须读**已合并**的 _SLOT_TTL/_SLOT_OPEN_EARLY，
+    #不能读 _FALLBACK_*副本。副本只在 analyze.py解析失败时才有意义；
+    #平时读副本意味着 analyze侧改了 TTL，面板仍按旧值判「还在窗口内」，
+    #与真实的 _in_grace上界再次分叉（同一条 bug的第二形态）。
     """该槽位的**有效窗口**宽度（分钟，相对计划时刻）。
 
     ⚠️⚠️2026-11-21（P1）：必须复现 `analyze.hourly_slot._in_grace`的
@@ -1884,8 +1898,8 @@ def _slot_window_grace(key):
     """
     try:
         _t = _slot_min(key)
-        if _t is None: return int(_FALLBACK_SLOT_TTL.get(key, 20)) + _RETRY_GRACE
-        _ttl = int(_FALLBACK_SLOT_TTL.get(key,20))
+        if _t is None: return int(_SLOT_TTL.get(key, 20)) + _RETRY_GRACE
+        _ttl = int(_SLOT_TTL.get(key,20))
         _upper = _t + _ttl + _RETRY_GRACE
         _cap = _next_start_after(_t)
         if _cap is not None: _upper = min(_upper, _cap)
@@ -1893,7 +1907,7 @@ def _slot_window_grace(key):
         if _vu is not None: _upper = min(_upper, _vu)
         return max(1, _upper - _t)
     except Exception:
-        return int(_FALLBACK_SLOT_TTL.get(key, 20)) + _RETRY_GRACE
+        return int(_SLOT_TTL.get(key, 20)) + _RETRY_GRACE
 
 
 def _next_start_after(target):
@@ -1901,7 +1915,7 @@ def _next_start_after(target):
 
     与 `analyze._grace_cap`同一口径：宽限不得吃掉别人的时段。
     """
-    _starts = ([_slot_min(_k) - _FALLBACK_SLOT_OPEN_EARLY.get(_k,0)
+    _starts = ([_slot_min(_k) - _SLOT_OPEN_EARLY.get(_k,0)
         for _k, _, _ in _FALLBACK_SLOTS if _slot_min(_k) is not None]
     + [_DL_START, _SM_START])
     _later = [x for x in _starts if x > target]
@@ -2601,7 +2615,12 @@ async function render(){
   } else {
     h += `<table><tr><th>时间</th><th>脚本</th><th>阶段</th><th>结果</th>
           <th>耗时</th><th>时段/事件</th></tr>`;
-    for(const r of runs.rows.slice().reverse().slice(0,220)){
+    //2026-11-21（P3）：最多只画 ROWS_SHOWN行**且必须说明**。
+    //原先静默截断到220，而标题报的是 runs.total（实测24720）——
+    //查「今天哪轮失败」翻不到时会判成"没执行"。
+    //与同文件 folds_truncated / rows_truncated的原则保持一致。
+    const ROWS_SHOWN =220;
+    for(const r of runs.rows.slice().reverse().slice(0, ROWS_SHOWN)){
       /* `starved_slots` 只在慢轮（耗时 > 调度间隔）的 analyze end 记录上出现 */
       /* ⚠️ 必须过 `esc()`（2026-10-29 修，P3）：这是全页**唯一**一处没转义的
          服务端插值。写入侧 `runlog.py` 会 `int(starved)`，但威胁模型是
@@ -2626,6 +2645,11 @@ async function render(){
            " · "+esc(r.events.join(",")):""}${r.note?" · "+esc(r.note).slice(0,40):""}</td></tr>`;
     }
     h += `</table>`;
+   //截断必须说出口：否则标题报 runs.total、表里只有220行，
+   //查「今天哪轮失败」翻不到时会判成没执行。
+   if((runs.total||0) > ROWS_SHOWN){
+    h += `<div class="warn">仅显示最近 ${ROWS_SHOWN}条，另有 ${runs.total-ROWS_SHOWN}条未渲染 ——完整流水见 state/history/runs.jsonl</div>`;
+   }
   }
   h += `</div>`;
 
@@ -2665,9 +2689,41 @@ async function render(){
   document.getElementById("app").innerHTML = h;
 }
 
-render().catch(e => {
+// ⚠️⚠️2026-11-21（P1）：**面板必须自己刷新**。
+//原实现只在载入时 render()一次，全文件0个 setInterval/setTimeout：
+//09:20打开到11:00仍显示09:20的快照 ——槽位状态不前进、
+// health.age_sec / boards.age_sec / 「推送 x/y」全冻结。
+//表体看起来一切正常，只有顶部小字 sum.now能看出是旧的。
+//一个盯盘面板停在载入那一刻，比没有面板更危险：会让人以为"现在没变化"。
+let _refreshTimer = null;
+let _refreshing = false;
+async function _tick(){
+ //只重画内容、不重置滚动与展开状态：
+ // document.getElementById("app").innerHTML会重建 DOM，
+ //所以刷新前记下滚动位置，刷新后还原。
+ if(_refreshing) return;
+ _refreshing = true;
+ const _y = window.scrollY;
+ try{
+  await render();
+  window.scrollTo(0, _y);
+ }catch(e){
   document.getElementById("app").innerHTML =
-    `<div class="warn">载入失败：${esc(e.message)}</div>`;
+   `<div class="warn">载入失败：${esc(e.message)}</div>`;
+ }finally{
+  _refreshing = false;
+ }
+}
+_tick();
+//30秒一轮：后端最细的槽位判定是分钟级，30s足够又不至于打爆服务。
+//页面隐藏时暂停（省电，也避免夜里挂着标签页空转）。
+_refreshTimer = setInterval(() => {
+ if(document.hidden) return;
+ _tick();
+},30000);
+document.addEventListener("visibilitychange", () => {
+ //切回标签页立刻刷一次：否则要先等最多30s才看到最新状态。
+ if(!document.hidden) _tick();
 });
 </script></body></html>"""
 
