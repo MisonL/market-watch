@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "src"))
 import scheduler as S  # noqa: E402
 
 _ok = [0]
+_skipped = []
 
 
 def check(cond, msg):
@@ -163,7 +164,11 @@ def _check_memory_contract():
     try:
         _src = open(_p, encoding="utf-8").read()
     except OSError:
-        return          # agent/ 是独立仓库，clone 里没有 → 跳过（不误报）
+        #2026-11-21: must NOT silently return. The old code returned here while
+        #the file still printed ALL PASS, so the memory-600-char contract was never
+        #verified on CI (agent/ not cloned) yet counted as PASS.
+        _skipped.append("memory-600-contract (agent/ not cloned)")
+        return
     import re as _re_mc
     # schema：append_memory 的 text.maxLength
     _m1 = _re_mc.search(
@@ -185,4 +190,11 @@ def _check_memory_contract():
 
 _check_memory_contract()
 
-print(f"ALL PASS (容器调度器 {_ok[0]} 个断言)")
+#2026-11-21: with any skipped item we must NOT print ALL PASS -- run_all
+#judges by the last-line marker and PASS would claim it was verified.
+_sep = chr(65307)
+if _skipped:
+ _todo = _sep.join(_skipped)
+ print(f"SKIP (容器调度器 {_ok[0]}项已验 / {len(_skipped)}项未验证: {_todo})")
+else:
+ print(f"ALL PASS (容器调度器 {_ok[0]}个断言)")

@@ -228,7 +228,16 @@ MUTANTS = [
      '"_ts_x": row.get("_ts", "")}',
      "_hk_quotes_via_tencent 构造行时 _ts 键名被改 → 新鲜度闸门失效"),
 
-    # --- 磁盘卫生轮转 glob 错（[磁盘卫生] 应抓）---
+    # ---实时取数绕过安全入口（[实时取数真值收口]应抓）---
+    #2026-11-21:把 AST闸门判据改成永不成立 ——模拟"新增消费方直接调用
+    #含测试源的主机列表"。自检必须报 ❌并点名文件:行号。
+    ("realtime-host-bypass",
+ "alert.py",
+ "for host in (M._ordered_real_em_hosts() if d is None else ()):",
+ "for host in (M._ordered_em_hosts() if d is None else ()):",
+ "实时消费方绕过安全入口 →大盘资金可取到测试源的假数据",
+ "直接用了含测试源的"),
+        # --- 磁盘卫生轮转 glob 错（[磁盘卫生] 应抓）---
     ("hygiene-glob-wrong",
      "selfcheck.py",
      "", "",

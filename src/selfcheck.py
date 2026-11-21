@@ -12458,6 +12458,62 @@ def _main(ok_all):
         _unverified[0] += 1
         print(f"  ❌ {e}"); ok_all = False
 
+    #14e-4d)实时取数模块**不得**直接调 `_ordered_em_hosts()` ——2026-11-21。
+    #
+    #这是「同一真值抄多份，改一处漏两处」的结构性堵法。修 push2test的过程：
+    #先修 quotes() → clist漏网 →再修 →板块日K漏网 →再修 → alert大盘资金 /
+    #feeds.health /热点量比又漏网。每次都只修"当前知道的消费方"，于是下一个
+    #继续拿假数据。现在只有一个安全入口 `_ordered_real_em_hosts()`，这里用
+    #AST静态扫描保证没人绕过它 ——新增消费方当场变红，而不是等用户看到假数据。
+    print("\n[实时取数真值收口]")
+    #hot的量比/63日涨幅取数主机同样不得含测试源 ——它不在 `_ordered_*`
+    #体系里，是自己维护的 VR_HOSTS元组。假源会同时污染量比基准(5日均额)
+    #与63日涨幅，且 base会写进 vr_base.json缓存一整天。
+    try:
+        import hot as _hot4d
+        _vrh = [str(x) for x in _hot4d.VR_HOSTS]
+        if any("push2test" in x for x in _vrh):
+            print(f" ❌ hot.VR_HOSTS含测试源：{_vrh}")
+            print(" →量比/63日涨幅会取自模拟盘，且缓存一整天")
+            ok_all = False
+        else:
+            print(f" ✅热点量比取数主机({len(_vrh)}台)不含测试源")
+    except Exception as e:
+        _unverified[0] +=1
+        print(f" ❌ {e}"); ok_all = False
+    
+    try:
+        import ast as _ast4d
+        _SRC4D = os.path.dirname(os.path.abspath(__file__))
+        _consumer_files = ["alert.py", "feeds.py", "hot.py", "analyze.py",
+            "collect.py", "webui.py"]
+        _bad4d = []
+        for _fn in _consumer_files:
+            _fp = os.path.join(_SRC4D, _fn)
+            if not os.path.exists(_fp):
+                continue
+            with open(_fp, encoding="utf-8") as _f4d:
+                _tree = _ast4d.parse(_f4d.read())
+            for _node in _ast4d.walk(_tree):
+                if not isinstance(_node, _ast4d.Call):
+                    continue
+                _f = _node.func
+                _nm = (getattr(_f, "attr", None) or getattr(_f, "id", None))
+                if _nm == "_ordered_em_hosts":
+                    _bad4d.append(f"{_fn}:{_node.lineno}")
+        if _bad4d:
+            print(f" ❌ {len(_bad4d)}处直接用了含测试源的"
+             f"`_ordered_em_hosts()`：{_bad4d[:4]}")
+            print(" →实时取数请走 `_ordered_real_em_hosts()`"
+             f"（已剔除 push2test）")
+            ok_all = False
+        else:
+            print(f" ✅实时取数模块（{len(_consumer_files)}个）"
+             f"均未直接用含测试源的主机列表")
+    except Exception as e:
+        _unverified[0] +=1
+        print(f" ❌ {e}"); ok_all = False
+    
     # 14e-5) AI 调用必须留痕（模型名/耗时/输出量）—— 2026-11-21。
     #
     # `AI_MODEL = None` 时走 CLI 的**默认模型**，那个 id 只存在于上游：
