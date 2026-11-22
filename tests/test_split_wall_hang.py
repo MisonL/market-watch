@@ -98,4 +98,26 @@ check(max(len(r) for r in _out.split("\n")) <= _LIMIT, "逗号长段出现超宽
 _short = "**盘面**一句话。"
 check(A._split_wall_lines(_short) == _short, "短行被无谓拆开")
 
+# ----------⑤形态 × 首段宽度的全量扫描（2026-11-22）----------
+#只扫 `_LIMIT-6..+7` 一种形态是不够的：回归可能出在「不可断长串」
+#「纯数字」「大量空格」这些各自走不同 `_cut` 分支的路径上，
+#而且这些宽度在 86~94 之外一样会触发。判据仍是终止/不超宽/不丢字。
+_SHAPES = {
+	"顿逗分隔": lambda w: "**盘面**" + "甲" * w + "；" + "乙" * 90,
+	"不可断串": lambda w: "**资金**" + "x" * w + "，" + "y" * 60,
+	"无标点": lambda w: "**热点**" + "丙" * w,
+	"纯数字": lambda w: "**资金**" + ("1234567890" * (w // 10 + 1))[:w],
+	"含空格": lambda w: "**盘面**" + ("涨 " * (w // 2 + 1))[:w] + "；尾",
+}
+for _name, _mk in _SHAPES.items():
+	for _w in range(1, 201):
+		_text = _mk(_w)
+		_out = split_guarded(_text, seconds=3)
+		check(_out is not None,
+			f"[{_name}]首段={_w}字时没有终止（死循环回归）")
+		check(max(len(r) for r in _out.split("\n")) <= _LIMIT,
+			f"[{_name}]首段={_w}字时出现超宽行")
+		check(_flat(_out) == _flat(_text),
+			f"[{_name}]首段={_w}字时内容被改动（丢字或多字）")
+
 print(f"ALL PASS (拆行终止性/宽度/内容保真 {_ok[0]}个断言)")

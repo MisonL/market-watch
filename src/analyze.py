@@ -6806,7 +6806,7 @@ def _split_wall_lines(t):
                 #先把已满的行落地，再按续行宽度继续；这样 _left必 >0。
                 if _cur != _head and len(_cur) >= _LIMIT:
                     _rows.append(_cur)
-                    _cur = " "
+                    _cur = "  "
                     _left = _cont_left
                 if _left <=0:
                     _left = max(1, _cont_left)

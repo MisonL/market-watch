@@ -190,6 +190,31 @@ def _kill_group(proc, name, grace=10):
             pass
 
 
+def _present_jobs(root, jobs=None):
+    """把调度表里**本部署根本没有的脚本**摘出去，返回 (保留, 缺失名)。
+
+    ⚠️ 2026-11-22：容器镜像**不含** `agent/`（`.dockerignore` 里有 `agent/`，
+    它带着本机 agent 的 state/logs），而 `JOBS` 里固定有 `agent/run.py`。
+    原实现是每轮循环都 `os.path.exists` 判一次、缺了就 `⚠️ …不存在，跳过`
+    —— 于是容器里**每小时**一条 ⚠️、一天 24 条、永不消失。
+
+    这不是偶发故障，而是「这套部署没有这个脚本」的**静态事实**：静态事实
+    应该在启动时说一次（`main()` 里报一次），而不是每 3600s 复读一遍。
+    复读的真实代价是**告警疲劳** —— 日志里长期存在一条永远为真的 ⚠️ 之后，
+    真的告警也一起被忽略。
+
+    保留运行期的存在性检查（脚本可能在运行中被删/被 git checkout 掉），
+    但那边改为「每个名字只报一次」（见 `_missing_logged`）。
+    """
+    _jobs, _absent = [], []
+    for _j in (JOBS if jobs is None else jobs):
+        if os.path.exists(os.path.join(root, _j[1])):
+            _jobs.append(_j)
+        else:
+            _absent.append(_j[0])
+    return _jobs, _absent
+
+
 def main():
     root = ROOT
     check_timezone()
@@ -207,14 +232,21 @@ def main():
         _log(f"⚠️ PID 文件写入失败（不影响调度）: {_e}")
 
     _log(f"调度器启动 · 根目录 {root}")
-    _log("jobs: " + ", ".join(f"{n}/{iv}s" for n, _s, iv, _p in JOBS)
+    # 缺脚本的 job 在**启动时**筛一次并报一次（原因见 `_present_jobs` 的说明）。
+    # 后续每轮循环只看筛过的表，不再为同一个静态缺失复读 ⚠️。
+    _jobs, _absent = _present_jobs(root)
+    if _absent:
+        _log(f"ℹ️ 本部署没有这些脚本，已从调度表移除：{', '.join(_absent)}"
+             f"（容器镜像按 .dockerignore 不含 agent/，属预期）")
+    _log("jobs: " + ", ".join(f"{n}/{iv}s" for n, _s, iv, _p in _jobs)
          + f" + {WEBUI[0]}(常驻)")
 
     procs = {}        # name -> Popen（只在跑着的 job 里有）
     started_at = {}   # name -> 本轮启动时刻（判 MAX_RUNTIME 用）
     next_at = {}      # name -> 下次触发时刻
+    _missing_logged = set()   # 运行期才缺的脚本：每个名字只报一次
     _now = time.time()
-    for name, _script, interval, _persist in JOBS:
+    for name, _script, interval, _persist in _jobs:
         # 对齐 launchd 的 RunAtLoad：collect/watch/agent 是 false（等一个间隔），
         # selfcheck 是 true（启动就跑一轮）。这里按"间隔"等，selfcheck 首次
         # 立即跑是它自己的语义（86400s 的间隔不该让首轮等一天）。
@@ -242,7 +274,7 @@ def main():
             _t = time.time()
 
             # ---- 定时 job ----
-            for name, script, interval, _persist in JOBS:
+            for name, script, interval, _persist in _jobs:
                 # ① 上一轮还在跑 → 跳过（复现 launchd 的"同 job 不并发"）
                 _p = procs.get(name)
                 if _p is not None:
@@ -275,7 +307,13 @@ def main():
                     continue
 
                 if not os.path.exists(os.path.join(root, script)):
-                    _log(f"⚠️ {name}: {script} 不存在，跳过")
+                    # 启动时已在场的脚本**运行中消失**才算异常（被删/被
+                    # checkout 掉），仍要让用户看见 —— 但只报一次：每分钟
+                    # 复读同一条只会把日志刷满，问题本身不会因此更清楚。
+                    if name not in _missing_logged:
+                        _missing_logged.add(name)
+                        _log(f"⚠️ {name}: {script} 运行中消失，本轮起跳过"
+                             f"（只报这一次）")
                     next_at[name] = _t + interval
                     continue
                 try:

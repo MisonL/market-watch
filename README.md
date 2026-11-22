@@ -109,7 +109,7 @@ python3 src/analyze.py
 # 自检
 python3 src/selfcheck.py
 
-#单元测试（本仓库61/61；全新克隆是58通过 +3跳过 ——
+#单元测试（本仓库62/62；全新克隆是59通过 +3跳过 ——
 #那3个需要 agent/.venv，而 agent/是独立仓库、不随本仓库分发）
 bash tests/run_all.sh
 ```

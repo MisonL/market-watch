@@ -12476,25 +12476,50 @@ def _main(ok_all):
         def _al4s(*_a):
             raise TimeoutError(">3s")
         _sig4s.signal(_sig4s.SIGALRM, _al4s)
+        # ⚠️2026-11-22：**只喂一种形态+5个宽度挡不住回归**。上一版全部用例
+        # 都是「甲…；乙…」这一种（有顿逗、可断），而回归恰恰可能出在
+        # `**段名**` 后直接跟不可断长串、无标点、纯数字、大量空格这些路径上
+        # ——它们各自走到 `_cut` 计算的不同分支。改成 5 种形态 × 首段 1~200 字，
+        # 并补上「正文不丢」断言：只测"能返回"的话，把内容截断也能通过。
+        _shapes4s = (
+            ("顿逗分隔", lambda _w: "**盘面**" + "甲" * _w + "；" + "乙" * 90),
+            ("不可断串", lambda _w: "**资金**" + "x" * _w + "，" + "y" * 60),
+            ("无标点", lambda _w: "**热点**" + "丙" * _w),
+            ("纯数字", lambda _w: "**资金**"
+             + ("1234567890" * (_w // 10 + 1))[:_w]),
+            ("含空格", lambda _w: "**盘面**"
+             + ("涨 " * (_w // 2 + 1))[:_w] + "；尾"),
+        )
+        def _flat4s(_s):
+            return "".join(_c for _c in _s if not _c.isspace())
         _bad4s = []
-        for _w4s in (86,87,88,89,90):
-            _txt = "**盘面**" + "甲" *(_w4s -10) + "；" + "乙" *90
-            _sig4s.alarm(3)
-            try:
-                _out4s = _A4s._split_wall_lines(_txt)
-            except TimeoutError:
-                _bad4s.append(f"首段{_w4s}字 ->超过3秒未返回（死循环回归）")
-                continue
-            finally:
-                _sig4s.alarm(0)
-            _mx = max(len(_x) for _x in _out4s.split("\n"))
-            if _mx > _A4s._SPLIT_LIMIT:
-                _bad4s.append(f"首段{_w4s}字 ->出现{_mx}字超宽行")
+        _n4s = 0
+        for _nm4s, _mk4s in _shapes4s:
+            for _w4s in range(1, 201):
+                _txt = _mk4s(_w4s)
+                _sig4s.alarm(3)
+                try:
+                    _out4s = _A4s._split_wall_lines(_txt)
+                except TimeoutError:
+                    _bad4s.append(f"{_nm4s}首段{_w4s}字 ->超过3秒未返回"
+                                  f"（死循环回归）")
+                    continue
+                finally:
+                    _sig4s.alarm(0)
+                _n4s += 1
+                _mx = max(len(_x) for _x in _out4s.split("\n"))
+                if _mx > _A4s._SPLIT_LIMIT:
+                    _bad4s.append(f"{_nm4s}首段{_w4s}字 ->出现{_mx}字超宽行")
+                _fa = _flat4s(_out4s)
+                _fb = _flat4s(_txt)
+                if _fa != _fb:
+                    _bad4s.append(f"{_nm4s}首段{_w4s}字 ->拆行后正文丢失"
+                                  f"（{len(_fa)}/{len(_fb)}字）")
         if _bad4s:
             print(f" ❌ {len(_bad4s)}种边界宽度拆行异常：{_bad4s[:3]}")
             ok_all = False
         else:
-            print(" ✅拆行在首段86~90字边界处均能终止，且每行不超阈值")
+            print(f" ✅{_n4s}种（形态×首段宽度）均能终止、不超阈值、正文不丢")
     except Exception as _e4s:
         _unverified[0] +=1
         print(f" ❌ {_e4s}"); ok_all = False
