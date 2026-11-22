@@ -24,9 +24,19 @@
 """
 import os
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+
+# ⚠️2026-11-22（P0写穿生产）：下面 `_FAIL`原先拼的是 `ROOT/state/cache/…`，
+#而本文件会 `os.remove(_FAIL)` ——**直接删生产的 AI熔断文件**。
+#必须先设 MW_DIR再 import paths；`_FAIL`改由 paths.p_cache解析。
+if not os.environ.get("MW_DIR"):
+    os.environ["MW_DIR"] = tempfile.mkdtemp(prefix="mw_aiobs_")
+_SB = os.environ["MW_DIR"]
+for _sub in ("state/history", "state/cache", "conf", "logs"):
+    os.makedirs(os.path.join(_SB, _sub), exist_ok=True)
 
 import marketlib as M                                  # noqa: E402
 import analyze as A                                    # noqa: E402
@@ -42,7 +52,10 @@ def check(cond, msg):
         raise SystemExit(1)
 
 
-_FAIL = os.path.join(ROOT, "state", "cache", "ai_fail.json")
+# ⚠️必须走 paths.p_cache（受 MW_DIR管辖），不能拼 ROOT ——
+#拼 ROOT等于固定指向生产目录，MW_DIR沙箱对它无效。
+from paths import p_cache as _p_cache # noqa: E402
+_FAIL = _p_cache("ai_fail.json")
 
 # 能过结构闸门的正文（够长、标签齐、有 > 引用行）。
 BODY = (

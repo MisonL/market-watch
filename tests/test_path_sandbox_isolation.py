@@ -172,4 +172,24 @@ if os.path.exists(_pushes):
 	      f"生产 pushes.jsonl新增了 {len(_bad)}条合成数据 —— "
 	      f"测试又写穿了生产：{_bad[:2]}")
 
+# ----------⑧测试不得把 `ROOT/state…`硬编码----------
+#
+# ⚠️`test_ai_observability`原先写的是
+# `_FAIL = os.path.join(ROOT, "state", "cache", "ai_fail.json")`，
+#然后 `os.remove(_FAIL)` ——**MW_DIR沙箱对它完全无效**，
+#每跑一次就删一次生产的 AI熔断文件（run_all.sh的注释记着这件事）。
+#判据：除本文件外，任何测试都不得拼 `ROOT/state`。
+_hard = []
+_pat = re.compile(r'os\.path\.join\(ROOT,\s*"state"')
+for _fn in sorted(os.listdir(os.path.join(ROOT, "tests"))):
+	if not _fn.endswith(".py") or _fn == "test_path_sandbox_isolation.py":
+		continue
+	with io.open(os.path.join(ROOT, "tests", _fn),
+		encoding="utf-8") as _fh:
+		_txt = _fh.read()
+	if _pat.search(_txt):
+		_hard.append(_fn)
+check(not _hard,
+	f"这些测试把 ROOT/state硬编码了（MW_DIR沙箱对它们无效）：{_hard}")
+
 print(f"ALL PASS (沙箱真隔离 {_ok[0]}个断言)")
