@@ -1713,6 +1713,59 @@ class _HostCircuit(_RateLimited):
 
 HOST_CIRCUIT = _HostCircuit()
 
+#本轮取数是否**走过兜底层**（代理 / firecrawl），按主机记录。
+#
+# ##为什么需要这个标记
+#
+# `cj()`的返回契约是「dict或 None」，**不区分**这份数据是直连拿到的
+#还是云端兜底拿到的。对绝大多数消费方这是对的（能取到数就行），
+#但 `feeds.health()`要回答的是另一个问题：**这个源本身还通不通**。
+#
+#混为一谈的后果是**主源长期故障被兜底层盖住**：
+# `[实测]`2026-11-22 ——本机直连东财 push2/push2his全被远端 RST
+# （curl exit52，HTTP/HTTPS皆然），而 `health()["eastmoney"]`报 ✅，
+#唯一原因是 `cj()`判死后经 firecrawl云端兜底把数据拿了回来。
+#同一小时内 firecrawl进入冷却后，同一条 health立刻变 ❌ ——
+# **同一台主机、同一天，结论随云端额度摇摆**，而它本该反映"源"的状态。
+#
+#危害是双层的：
+#①兜底额度被耗尽时故障**同时爆发**（主源早坏了，只是没人知道）；
+#②自检的 `[数据源]`段长期报绿，运维失去"该换源了"的信号。
+#
+# ##契约
+#
+# ·只在 `cj()`里写，**不影响任何返回值语义**（纯旁路标记）；
+# ·`_fb_used(host)`返回「刚才这次取数是否走了兜底」，不清零 ——
+#调用方自己决定何时 `_fb_clear()`，避免两次调用互相擦除；
+# ·失败静默：标记是诊断用的，绝不能因为它让取数挂掉。
+_FB_USED: set = set()
+
+
+def _fb_mark(host):
+    """记录 host的这次成功**来自兜底层**（代理/firecrawl）。"""
+    try:
+        if host:
+            _FB_USED.add(host)
+    except Exception:
+        pass
+
+
+def _fb_used(host):
+    """host自上次 `_fb_clear()`起是否成功走过兜底层。"""
+    try:
+        return bool(host) and host in _FB_USED
+    except Exception:
+        return False
+
+
+def _fb_clear():
+    """清空兜底标记（`health()`每次探测前调用，保证读的是本轮结果）。"""
+    try:
+        _FB_USED.clear()
+    except Exception:
+        pass
+
+
 # 半开探测的进程内去重：同一轮里同一台主机只允许一次"试探"，
 # 避免一次取数（21 个标的）对同一台刚到期的主机连发 21 个探针包。
 _HALF_OPEN_TRIED = set()
@@ -2641,6 +2694,8 @@ def _fallback_get(url, ref=None, host=None, timeout=20):
     _d = proxy_json(url, ref=ref, timeout=timeout)
     if _d is not None:
         _proxy_fallback_log_once(host)
+        #旁路标记：让 health()知道这次是兜底拿到的，不是直连
+        _fb_mark(host)
         return _d
     # ⚠⚠ 2026-11-11（审查，P2）：**firecrawl 不能硬编码自己的 90s**。
     # 原写 `timeout=FIRECRAWL_TIMEOUT`（固定 90s），而 `cj()` 的 `timeout` 参数
@@ -2660,6 +2715,8 @@ def _fallback_get(url, ref=None, host=None, timeout=20):
         _daily_log_once(host, "fcfallback",
                         f"直连与代理均失败，经 firecrawl 兜底成功: {host}"
                         f"（本日首次，同主机后续不再重复）")
+        #旁路标记：同上，health()据此区分「源通」与「靠兜底」
+        _fb_mark(host)
         return _d
     return None
 

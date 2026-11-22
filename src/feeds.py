@@ -594,6 +594,9 @@ def health():
     # 正好是 health() 想要的语义；取前两台即可（health 只是布尔探活，
     # 不需要把四台全打一遍 —— 那是纯耗配额）。
     try:
+        # ⚠️探测前清空兜底标记 ——读的必须是**本轮**结果，
+        #否则上一轮甚至上一个源的标记会串到本轮。
+        M._fb_clear()
         _em_hosts = M._ordered_real_em_hosts()[:2]
         d = M.cj(f"{_em_hosts[0]}/ulist.np/get?secids=1.000001&fields=f2"
                  f"&ut={M.UT}&fltt=2&invt=2", timeout=8, retries=1)
@@ -610,6 +613,18 @@ def health():
             # 这里是 `d2` —— 同一个惯用法，同样要修。
             ok = bool(M._has_data(d2))
             if ok: res["eastmoney_backup"] = True
+        # ⚠️2026-11-22：**区分「源通」与「靠兜底通」**。
+        # `cj()`的返回不区分这两者，于是主源长期直连失败时
+        # `health()`照样报 ✅（今天本机实测：东财对出口 IP全线 RST，
+        # health的绿全部来自 firecrawl云端兜底）。
+        #有了这个标记，自检可以说清「这个源现在**只能靠兜底**」——
+        #那是"该换源了"的信号，不是"一切正常"。
+        if ok:
+            _em_fb = any(M._fb_used(M._host_of(h)) or M._fb_used(h)
+             for h in _em_hosts)
+            if _em_fb:
+                res["eastmoney_fallback"] = True
+        
         res["eastmoney"] = ok
     except Exception:
         res["eastmoney"] = False

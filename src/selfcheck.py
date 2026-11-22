@@ -2012,6 +2012,18 @@ def _main(ok_all):
         for k, v in h.items():
             _mark = "⚠️ " if (not v and k in _risk) else _src_mark
             print(f"  {'✅' if v else _mark} {k}")
+
+            # ⚠️2026-11-22：东财**只能靠兜底**时必须说清。
+            # `cj()`会把代理/firecrawl的结果原样返回，于是主源直连
+            #长期失败（今天本机：东财对出口 IP全线 RST）时 `health()`
+            #照样 ✅ ——那是"云端替它扛着"，不是"这个源还好着"。
+            #两种情况处置完全相反：源通 →什么都不用做；
+            #只能靠兜底 →该换源/查 IP封禁，且兜底额度一耗尽就同时崩。
+            #不计入 `_unverified`：它确实取到数了（不是"没验证"），
+            #也不置 ok_all（数据链路当前是通的，不构成故障）。
+            if k == "eastmoney" and v and h.get("eastmoney_fallback"):
+                print(" →本次数据来自**云端兜底**（直连/代理均失败）——"
+                 "该源直连已不通，兜底额度耗尽时会整体失效")
             if k == "eastmoney" and not v and not _quota_out:
                 print("      → 主源不可用，走备用行情主机/腾讯/新浪")
         # ⚠️ 逐源的 `❌` 必须**影响结论**，不能只打印。
