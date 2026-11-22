@@ -2376,6 +2376,25 @@ def _proxy_fallback_log_once(host):
         f"直连失败，经代理兜底成功: {host}（本日首次，同主机后续不再重复）")
 FIRECRAWL_COOLDOWN = 900        # 冷却 15 分钟；期间不再尝试
 
+# ⚠️⚠️ 2026-11-23（P1 静默截断的真正根因）：**限流不是故障，不该按故障冷却**。
+#
+# `[实测]` firecrawl 有每分钟请求数上限。超限时 CLI 的行为是
+#   rc=1 + stdout 为空 + stderr="Error: Rate limit exceeded.
+#   Consumed (req/min): 12, Remaining (req/min): ..."
+# 而 `firecrawl_get` 把"stdout 为空"一律当失败，套用 900s 冷却 ——
+# 于是**一次限流 = 整条东财链路停摆 15 分钟**。
+#
+# 这正好解释了板块列表的静默截断：一次全量 clist 要 6 页，共 6 次
+# firecrawl 调用；行业+概念两轮就是 12 次，刚好压在每分钟上限上。
+# `[实测]` 概念板块 554 个，6 页在第 5 页撞上限 ->
+# 剩余页在冷却期内**立即失败**（0.0s）-> 拿到 400/554 条。
+# 而 400 条被当作成功返回（原代码直接 break），按 f62 降序时
+# 缺的正是流出最猛的那批板块。
+#
+# 限流窗口只有一分钟级，恢复很快；用 900s 冷却属于**惩罚过度**。
+# 分档后：限流 -> 60s 后重试；其余失败 -> 仍是 900s。
+FIRECRAWL_RATE_LIMIT_COOLDOWN = 60
+
 # 代理兜底的失败冷却（2026-10-14 九维度审查 P1）：firecrawl 有冷却而代理
 # 没有 —— 不对称。代理的故障形态分两种：拒连（curl rc=5，0.0s 立即失败，
 # 无害）；**黑洞**（代理活着但丢包，curl 挂满 max-time=20s）—— 后者一轮
@@ -2418,8 +2437,19 @@ def firecrawl_get(url, timeout=None):
         return None
     out = (r.stdout or "").strip()
     if not out:
+        # ⚠️2026-11-23：**限流**要单独识别。它既不是网络故障、也不是
+        # 站点问题，而是"这一分钟额度用完了"，60 秒后就恢复。
+        # 原先并入通用失败套 900s 冷却，等于一次限流毁掉 15 分钟的
+        # 全部东财取数（板块列表因此静默截断到 400/554）。
+        _err = (r.stderr or "")
+        if "Rate limit" in _err or "rate limit" in _err:
+            log(f"firecrawl **限流**（不是故障）：{_err.strip()[:120]!r} —— "
+                f"冷却 {FIRECRAWL_RATE_LIMIT_COOLDOWN}s 后重试；"
+                f"本轮该接口的数据会缺失/不完整", "FEED")
+            _fc_fail_set(time.time() + FIRECRAWL_RATE_LIMIT_COOLDOWN)
+            return None
         log(f"firecrawl 无输出 rc={r.returncode} "
-            f"stderr={(r.stderr or '')[:120]!r}", "FEED")
+            f"stderr={_err[:120]!r}", "FEED")
         _fc_fail_set(time.time() + FIRECRAWL_COOLDOWN)
         return None
     # ⚠️ CLI 会先打印一行 `Scrape ID: xxx`，必须剥掉，否则调用方的
@@ -4777,6 +4807,35 @@ def data_cap(own_s, what=""):
     return _cap
 
 
+# 单页瞬时失败的重试次数（见 clist() 内「一页失败不等于翻到头了」）。
+# 取 2：firecrawl 偶发空包通常第二次就好；再大就会把一个慢故障
+# 拖成整轮超时，而 budget_s 只挡"慢"挡不住"次数"。
+_PAGE_RETRY = 2
+
+def _page_short(_inner, _total, _pace, _n_out):
+    """这一页是否"比应有的短" —— 服务端漏行的信号。
+
+    判据：还没取够 `total`，但本页行数比**已观察到的最大页**还少。
+    两个前提缺一不可：
+      · `_total` 未知 -> 无从判断，一律不短（否则会无限重试）；
+      · `_pace` 还没建立（第一页）-> 无基准，不短。
+
+    为什么不拿 `pz` 当基准：服务端会把 `pz` 截到自己的上限
+    （实测明文主机对 pz=500 只返 100 行），用 pz 判会把每一页都误判。
+
+    `[实测]` 2026-11-23：第 5 页返回 50 条（其余各页 100 条），
+    `total=554` 而累计才 450 —— 原实现只在**空包**时重试，
+    这种"短页"被当成正常末页，最终 504/554 静默少 50 个板块。
+    """
+    try:
+        if _total is None or not _pace:
+            return False
+        _rows = _inner["diff"]
+        _rows = _rows if isinstance(_rows, list) else list(_rows.values())
+        return (_n_out + len(_rows) < _total) and (len(_rows) < _pace)
+    except Exception:
+        return False
+
 def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
           with_total=False):
     """板块列表（clist）。该接口收盘后常被限流，失败返回空列表。
@@ -4807,6 +4866,9 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
     budget_s = data_cap(budget_s, what=f"clist({fs})")
     _total = None
     _seen = set()          # 已取到的 f12，用于跨页去重与防死循环
+    # 已观察到的**最大单页行数**。短页判据不能用 `pz` —— 服务端会把它
+    # 截到自己的上限（实测 500 -> 100），拿 pz 当基准会把每页都误判成短页。
+    _pace = 0
     for pn in range(1, max_pn+1):
         # 每页开工前判一次（而不是每次 cj 前）：一页最多 2 次 cj，
         # 判在页边界已足够阻止 70 分钟的累积，且不改变单页的完整语义
@@ -4815,13 +4877,74 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
             log(f"clist 总耗时超预算 {budget_s}s（已取 {len(out)} 条，"
                 f"{pn-1} 页）—— 停止翻页，用已拿到的部分", "FEED")
             break
+        # ⚠️⚠️ 2026-11-23（P1 静默截断）：**一页失败不等于翻到头了**。
+        #
+        # `[实测]` 同一分钟内对 `m:90+t:3`（概念 554 个）连做两次全量：
+        #   max_pn=8  -> 6 页, 554 条, total=554  ← 完整
+        #   max_pn=12 -> 5 页, 400 条, total=554  ← 缺 154 个
+        # 差别只在第 5 页那一次 `cj` 撞上瞬时失败（firecrawl 偶发空包/限流）：
+        # 该页 `_has_data` 为假 -> 直接 break -> **返回 400 条就当成功**。
+        # 而 `total=554` 明摆着还没拿完。
+        #
+        # 后果：`alert._sector_rows` 与 `hot.fetch_sectors` 都会拿到残缺名单，
+        # 而按 `fid=f62` 降序时**被丢的正是流出最猛的那批**（分页靠后），
+        # 于是「外资/融资盘整体撤离」这类最该报的紧急项永远看不见。
+        #
+        # 修法（三条，缺一不可）：
+        #   ① 空页   -> 重试该页（最多 _PAGE_RETRY 次）；
+        #   ② 短页   -> 也重试（服务端漏行时本页比前几页少，但 total 还没够）；
+        #   ③ 预算耗尽 / 重试用尽 -> 各自留痕，不静默。两者处置完全不同
+        #      （预算要调上限，源坏要查火线），不能都报成"源故障"。
+        #
+        # `total` 未知时无法区分"没有更多页"与"这页失败了"，故只在
+        # **一条都没拿到**时重试第一页 —— 拿不到东西没有任何理由不重试。
         d = None
         for host in _https_hosts():
-            d = cj(f"{host}/clist/get?pn={pn}&pz={pz}&po={po}&np=1&fltt=2&invt=2"
-                   f"&fid={fid}&fs={fs}&fields={fields}&ut={UT}")
+            d = cj(f"{host}/clist/get?pn={pn}&pz={pz}&po={po}&np=1"
+                   f"&fltt=2&invt=2&fid={fid}&fs={fs}&fields={fields}&ut={UT}")
             if _has_data(d, "diff"):
                 break
         _inner = _has_data(d, "diff")
+        # 何时重试这一页：分三种情况，各有各的理由 ——
+        #   ① 空页 + total 已知 + 还没取够 -> 明确是失败，必须重试；
+        #   ② 空页 + 一条都没拿到          -> 空手时没有理由不重试；
+        #   ③ 短页                          -> 服务端漏行，重试能补回来。
+        # ⚠️ 唯独"空页 + total 未知 + 已有数据"**不重试**：此时无法区分
+        # "这就是最后一页"与"这页失败了"，重试会在真末页白打请求。
+        _need = (
+            (not _inner and (not out or (_total is not None
+                                         and len(out) < _total)))
+            or (_inner and _page_short(_inner, _total, _pace, len(out)))
+        )
+        if _need:
+            _gave_up_for_budget = False
+            for _try in range(_PAGE_RETRY):
+                if budget_s is not None and time.monotonic() - _t0 > budget_s:
+                    # ⚠️（2026-11-23 codex P1）这条 `break` 会**跳过 `for...else`**，
+                    # 于是"重试用尽"不打印。若不在此处单独记一笔，出口只会看到
+                    # `len(out) < _total`，把**预算耗尽**误报成源故障。
+                    _gave_up_for_budget = True
+                    log(f"clist({fs}) 第 {pn} 页重试前预算已耗尽"
+                        f"（{time.monotonic() - _t0:.1f}s > {budget_s}s），放弃重试"
+                        f" —— 这是**预算**不够，不是源坏了", "FEED")
+                    break
+                _was_empty = not _inner     # 记下这次是空包还是短页，供日志区分
+                d = None
+                for host in _https_hosts():
+                    d = cj(f"{host}/clist/get?pn={pn}&pz={pz}&po={po}&np=1"
+                           f"&fltt=2&invt=2&fid={fid}&fs={fs}&fields={fields}&ut={UT}")
+                    if _has_data(d, "diff"):
+                        break
+                _inner = _has_data(d, "diff")
+                if _inner and not _page_short(_inner, _total, _pace, len(out)):
+                    _what = "空包" if _was_empty else "短页"
+                    log(f"clist({fs}) 第 {pn} 页{_what}，重试 "
+                        f"{_try+1}/{_PAGE_RETRY} 成功", "FEED")
+                    break
+            else:
+                log(f"clist({fs}) 第 {pn} 页重试 {_PAGE_RETRY} 次仍失败"
+                    f"（缺口由出口处统一报，此处不重复记已取的 {len(out)} 条）",
+                    "FEED")
         if not _inner:
             break
         # ⚠️ diff 有**两种形状**：list，或 dict（键为序号字符串）。
@@ -4834,20 +4957,13 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
         got = _inner["diff"]
         if not isinstance(got, list):
             got = list(got.values())
-        # ⚠️ **终止判据必须用服务端的 total，不能用 `len(got) < pz`**
-        # （2026-10-22 实测）。原写法有一个静默截断的致命形态：
-        # 服务端可能把 pz **截到自己的上限**再返回 —— 实测明文 HTTP 主机
-        # 对 pz=200/500 一律只返 100 行，且翻页偏移也按 100 算
-        # （`pn=2&pz=500` 与 `pn=2&pz=100` 返回同一批）。
-        # 于是一次 `clist(pz=500)` 拿到 100 行 → `100 < 500` 成立 →
-        # **立刻 break** → 496 个行业板块只返回 100 个，而且
-        # 返回的是"看起来正常的一页"，调用方无从察觉少了 80%。
-        # `hot.fetch_sectors` / `alert._sector_rows` 都传 pz=500，
-        # 一旦哪天候选池里出现会截断的主机，热点榜与板块资金扫描
-        # 会**同时**静默丢掉 4/5 的板块 —— 且日志里一个字都没有。
-        #
-        # 现在：total 已知就用 total 判；未知则退化为"本页为空才停"，
-        # 并靠 _seen 去重 + max_pn 兜底，绝不因为"比 pz 少"而提前停。
+        if len(got) > _pace:
+            _pace = len(got)
+        # ⚠️ 终止判据必须用服务端的 `total`，不能用 `len(got) < pz`
+        # （2026-10-22 实测）：服务端会把 pz 截到自己的上限再返回，
+        # 于是 `pz=500` 拿到 100 行，`100 < 500` 成立 -> 立刻 break ->
+        # 496 个行业只返回 100 个，且返回的是"看起来正常的一页"。
+        # 现在：total 已知就用 total 判；未知则退化为"本页为空才停"。
         if _total is None:
             _t = _inner.get("total")
             _total = _t if isinstance(_t, int) and _t > 0 else None
@@ -4864,12 +4980,27 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
             break
         if _total is not None and len(out) >= _total:
             break
-        # 服务端把 pz 截断了：本页拿到的是"它允许的最大页大小"，
-        # 说明还有后续页 —— **继续翻**，不要按 `len(got) < pz` 停。
         # 只有"本页一条新增都没有"才停（防止服务端忽略 pn、永远返第一页
-        # 时打满 max_pn 次无用请求）。
+        # 时打满 max_pn 次无用请求）。**不要**按 `len(got) < pz` 停。
         if _new == 0:
             break
+    # ⚠️⚠️ 2026-11-23（P1 可观测性）：**所有**"没取全"都必须在出口处留痕。
+    #
+    # 上面那个重试只覆盖「某一页返回空包」一种形态。实测还有两种同样静默：
+    #   · 第 1 页就失败 -> out 为空 -> 调用方 `_sector_rows` 返回 []，
+    #     `check_sector_fund` 遍历不到任何行 -> **本轮一条板块告警都不发**；
+    #   · 服务端忽略 pn、每页都返第一页 -> `_new == 0` 提前 break，
+    #     拿到 400/554 条，而 total 明摆着还差 154。
+    # 三种形态的共同后果：**看起来正常地少了一批板块**，日志里没有一行字。
+    # 这正是本仓库反复修的那类「静默降级」——所以判据放在出口，
+    # 而不是散在各个 break 分支里（漏一个分支就漏一种形态）。
+    if not out:
+        log(f"clist({fs}) **完全取不到**（0 条）—— 本轮板块列表整段缺失，"
+            f"热点榜与板块资金告警都会静默跳过", "FEED")
+    elif _total is not None and len(out) < _total:
+        log(f"clist({fs}) 名单不完整：已取 {len(out)}/{_total} 条"
+            f"（缺 {_total - len(out)} 个）—— 按 fid={fid} 降序时"
+            f"缺失的正是排在最后的那些", "FEED")
     # ⚠ 2026-11-10（Codex P2）：可选回传服务端声明的 `total`。
     # 原来 `_total` 只在函数内部用于判终止，调用方**无法知道
     # 自己拿到的是完整名单还是截断的部分** ——
