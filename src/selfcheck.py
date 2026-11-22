@@ -2009,7 +2009,18 @@ def _main(ok_all):
         # （2026-10-16 17:42 那条即此因）。分档后：风控 → ⚠️ + 本轮未验证
         # （不置 rc）；其余失败 → ❌（照旧推）。
         _risk = getattr(feeds, "RISK_BLOCKED", set())
+        # ⚠️2026-11-22：`health()` 的返回里混了**元数据键**，它们不是源。
+        # `eastmoney_backup`（备用主机也通）、`eastmoney_fallback`（靠兜底通）
+        # 都是对 `eastmoney` 的补充说明。原先直接遍历 `h.items()`，
+        # 于是面板上多出两行 `✅ eastmoney_fallback` —— 读者会以为
+        # 多了两个数据源；更糟的是 `_dead` 也把它们当源，
+        # 哪天某个元数据键取 False 就会凭空多报一个「源不可用」。
+        # 变异体的夹具注释里已经踩过这个坑（`eastmoney_backup` 写 False
+        # 会让基线恒带 1 条 ❌），这里把判据补齐：元数据只做说明，不算源。
+        _meta_keys = {"eastmoney_backup", "eastmoney_fallback"}
         for k, v in h.items():
+            if k in _meta_keys:
+                continue
             _mark = "⚠️ " if (not v and k in _risk) else _src_mark
             print(f"  {'✅' if v else _mark} {k}")
 
@@ -2022,8 +2033,13 @@ def _main(ok_all):
             #不计入 `_unverified`：它确实取到数了（不是"没验证"），
             #也不置 ok_all（数据链路当前是通的，不构成故障）。
             if k == "eastmoney" and v and h.get("eastmoney_fallback"):
-                print(" →本次数据来自**云端兜底**（直连/代理均失败）——"
-                 "该源直连已不通，兜底额度耗尽时会整体失效")
+                # ⚠️2026-11-22：文案**不得**写死传输层。
+                # `_fb_mark` 在**代理成功**时也会打标（代理是兜底第一档），
+                # 那时 firecrawl 根本没被调用 —— 原先那句「直连/代理均失败」
+                # 对代理路径是**假话**，会让运维去查一个没坏的东西。
+                # 标记只回答"是否走了兜底层"，不回答"走的哪一档"。
+                print(" →本次数据来自**兜底链**（直连不通，经代理或 firecrawl）"
+                 " ——该源直连已失效，兜底额度/代理耗尽时会整体不可用")
             if k == "eastmoney" and not v and not _quota_out:
                 print("      → 主源不可用，走备用行情主机/腾讯/新浪")
         # ⚠️ 逐源的 `❌` 必须**影响结论**，不能只打印。
@@ -2062,7 +2078,8 @@ def _main(ok_all):
         # 返回空），逐源 ❌ 与"降级链少 5 档"都是**假信号**：源可能一台都没坏，
         # 只是这一轮没配额去探测。必须先把这种情况摘出来，否则每个
         # 配额耗尽的交易日都必然假红（09-22、09-30 均出现过 2000/2000）。
-        _dead = sorted(k for k, v in h.items() if not v)
+        _dead = sorted(k for k, v in h.items()
+                       if not v and k not in _meta_keys)
         if "eastmoney" in _dead and h.get("eastmoney_backup"):
             _dead = [k for k in _dead if k != "eastmoney"]
         # 风控源从 _dead 剔除（不计入"降级链少一档"），但计入 _unverified：

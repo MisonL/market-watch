@@ -446,6 +446,38 @@ def _usable_row(r):
     return isinstance(r, dict) and M.isnum(r.get("px")) and r["px"] > 0
 
 
+def _em_usable(d):
+    """东财 ulist 响应是否**真的带回价格**（值级判据，看 f2）。
+
+    ⚠️2026-11-22：原判据是 `bool(M._has_data(d))` —— 只要内层 dict 非空
+    就算通。而东财在**熔断/降级**时会回 `{"data": {"diff": [{"f2": null}]}}`，
+    内层非空、价格却是 null：`health()["eastmoney"] = True`，
+    实际一个可用数字都没有。
+
+    这与本文件里腾讯那条（`feeds.py` 的"用**值级**判据而不是 bool(容器)"）
+    是同一类：`f2: null` / 空值行一律判"健康"，`[数据源]` 长期全绿。
+    东财这条当时漏改了，这里补齐。
+    """
+    try:
+        _inner = M._has_data(d)
+        if not _inner:
+            return False
+        _rows = _inner.get("diff") if isinstance(_inner, dict) else None
+        if isinstance(_rows, dict):
+            _rows = list(_rows.values())
+        if not isinstance(_rows, list):
+            # 内层结构不是预期形状，但对布尔探活而言"有数据"已足够
+            return True
+        for _r in _rows:
+            if not isinstance(_r, dict):
+                continue
+            _px = _r.get("f2")
+            if M.isnum(_px) and _px > 0:
+                return True
+        return False
+    except Exception:
+        return False
+
 def backup_quotes(keys=None):
     """备用源取行情，返回与 marketlib.quotes 兼容的结构 {f12: row}"""
     keys = keys or list(MAP.keys())
@@ -594,38 +626,37 @@ def health():
     # 正好是 health() 想要的语义；取前两台即可（health 只是布尔探活，
     # 不需要把四台全打一遍 —— 那是纯耗配额）。
     try:
-        # ⚠️探测前清空兜底标记 ——读的必须是**本轮**结果，
-        #否则上一轮甚至上一个源的标记会串到本轮。
-        M._fb_clear()
         _em_hosts = M._ordered_real_em_hosts()[:2]
-        d = M.cj(f"{_em_hosts[0]}/ulist.np/get?secids=1.000001&fields=f2"
-                 f"&ut={M.UT}&fltt=2&invt=2", timeout=8, retries=1)
-        # ⚠️ 必须套 bool()：_has_data 现在返回**内层 dict**（见其 docstring），
-        # 直接赋值会让 res["eastmoney"] 存成 dict，而下游 selfcheck 读的是
-        # 真假值语义 —— 虽然 dict 的假值判断也对，但把 dict 写进"可用性布尔
-        # 表"会让日志/面板显示成 `{'f2': 3700}` 这种看不懂的东西。
-        ok = bool(M._has_data(d))
-        if not ok and len(_em_hosts) > 1:
-            d2 = M.cj(f"{_em_hosts[1]}/ulist.np/get?secids=1.000001&fields=f2"
+        # ⚠️2026-11-22：**区分「源通」与「靠兜底通」**，且**逐台**取溯源。
+        #
+        # `cj()` 的返回不区分数据是直连拿到的还是代理/firecrawl 兜底拿到的，
+        # 于是主源长期直连失败时 `health()` 照样报 ✅。
+        # 危害：兜底额度耗尽时故障同时爆发（主源早坏了没人知道），
+        # 自检 `[数据源]` 长期报绿，运维失去「该换源了」的信号。
+        #
+        # 溯源必须**每台单独取**，不能两台合并 `any()`：
+        # 第一台兜底成功但数据被判不合格、第二台直连成功时，
+        # 合并口径会把「第二台是直连通」误报成「只能靠兜底」。
+        # `_fb_clear()` 也要每台清一次 —— 标记按**裸主机名**记，
+        # http/https 两台共用同一个 key，不清就会串到下一台。
+        ok = False
+        _fb_prov = False
+        for _hi, _h in enumerate(_em_hosts):
+            M._fb_clear()
+            d = M.cj(f"{_h}/ulist.np/get?secids=1.000001&fields=f2"
                       f"&ut={M.UT}&fltt=2&invt=2", timeout=8, retries=1)
-            # 同上一行：`d2 and d2.get("data")` 在 d2 是 list/str/int 时
-            # AttributeError。selfcheck 的 [响应形状鲁棒性] 只扫变量名 `d`，
-            # 这里是 `d2` —— 同一个惯用法，同样要修。
-            ok = bool(M._has_data(d2))
-            if ok: res["eastmoney_backup"] = True
-        # ⚠️2026-11-22：**区分「源通」与「靠兜底通」**。
-        # `cj()`的返回不区分这两者，于是主源长期直连失败时
-        # `health()`照样报 ✅（今天本机实测：东财对出口 IP全线 RST，
-        # health的绿全部来自 firecrawl云端兜底）。
-        #有了这个标记，自检可以说清「这个源现在**只能靠兜底**」——
-        #那是"该换源了"的信号，不是"一切正常"。
-        if ok:
-            _em_fb = any(M._fb_used(M._host_of(h)) or M._fb_used(h)
-             for h in _em_hosts)
-            if _em_fb:
-                res["eastmoney_fallback"] = True
-        
+            if not _em_usable(d):
+                continue
+            ok = True
+            # 只认**这台真正通过判据的响应**的溯源，不聚合别的探测
+            _fb_prov = M._fb_used(M._host_of(_h)) or M._fb_used(_h)
+            if _hi > 0:
+                # 第一台不通、改由第二台应答 —— 记录"还有备用主机可用"
+                res["eastmoney_backup"] = True
+            break
         res["eastmoney"] = ok
+        if ok and _fb_prov:
+            res["eastmoney_fallback"] = True
     except Exception:
         res["eastmoney"] = False
     # 腾讯

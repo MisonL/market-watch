@@ -89,9 +89,16 @@ for _anchor in ("_proxy_fallback_log_once(host)", '"fcfallback"'):
 with io.open(os.path.join(ROOT, "src", "feeds.py"), encoding="utf-8") as _f:
 	_fd = _f.read()
 _i_clr = _fd.find("M._fb_clear()")
-_i_hosts = _fd.find("_ordered_real_em_hosts()[:2]")
-check(_i_clr >0, "feeds.health没有在探测前清空兜底标记（会串上一轮结果）")
-check(_i_clr < _i_hosts, "清空标记在探测**之后**才做 ——读的是旧值")
+check(_i_clr >0, "feeds.health没有清空兜底标记（会串上一轮结果）")
+# ⚠️2026-11-22：清空点从"整段探测前一次"改成"**每台探测前各一次**"。
+# 标记按**裸主机名**记，http/https 两台共用同一个 key ——
+# 只在整段前清一次，第二台会读到第一台的标记（串台）。
+_loop = _fd.find("for _hi, _h in enumerate(_em_hosts):")
+check(_loop >0, "feeds.health没有逐台探测循环")
+_i_clr_in = _fd.find("M._fb_clear()", _loop)
+_i_cj = _fd.find("M.cj(", _loop)
+check(_i_clr_in >0 and _i_clr_in < _i_cj,
+      "逐台循环里没有在 cj() 之前清标记 —— 第二台会读到第一台的标记")
 check('res["eastmoney_fallback"] = True' in _fd,
  "health没有输出 eastmoney_fallback标记")
 
@@ -111,6 +118,18 @@ check('res["eastmoney_fallback"] = True' in _fd
 with io.open(os.path.join(ROOT, "src", "selfcheck.py"),
  encoding="utf-8") as _f:
 	_sc = _f.read()
+# ⚠️元数据键**不算源**：`eastmoney_backup` / `eastmoney_fallback` 只是
+# 对 `eastmoney` 的补充说明。原实现直接遍历 `h.items()` 打印，
+# 面板上会多出 `✅ eastmoney_fallback`，读者以为多了两个源；
+# `_dead` 也把它们当源，某个元数据键取 False 就凭空多报一个「源不可用」。
+check('_meta_keys = {"eastmoney_backup", "eastmoney_fallback"}' in _sc,
+      "selfcheck 没有把兜底/备用元数据键排除在「源」之外 —— "
+      "面板会多打一行 ✅ eastmoney_fallback，_dead 也会把它们当源")
+_i_meta = _sc.find('_meta_keys = {"eastmoney_backup", "eastmoney_fallback"}')
+_i_dead = _sc.find('_dead = sorted(', _i_meta)
+check(_i_dead > _i_meta, "_dead 判据没有排除元数据键")
+check('k not in _meta_keys' in _sc[_i_dead:_i_dead + 120],
+      "_dead 仍会把 eastmoney_fallback 之类元数据键当成不可用源")
 check("eastmoney_fallback" in _sc,
  "selfcheck完全不看 eastmoney_fallback ——主源只能靠兜底时"
  "自检仍然只有一行 ✅，运维失去「该换源了」的信号")
@@ -122,6 +141,44 @@ check("云端兜底" in _win or "兜底" in _win,
 #不得把兜底当成❌：数据链路是通的，不该置红
 check("ok_all = False" not in _win,
  "把「走兜底」置成了 ❌ ——那会让正常兜底每轮假红")
+
+# ----------⑤b 东财误报：f2 为 null 时不得判健康----------
+#
+# ⚠️2026-11-22：原判据 `bool(M._has_data(d))` 只要内层 dict 非空就算通，
+# 而东财熔断/降级时回 `{"data": {"diff": [{"f2": null}]}}` ——
+# 内层非空、价格是 null，`health()["eastmoney"]` 却是 True。
+# 这与腾讯那条（`feeds.py` "用**值级**判据而不是 bool(容器)"）同一类，
+# 东财这条当时漏改了。
+import feeds as _F
+_null = {"data": {"diff": [{"f2": None}]}}
+_good = {"data": {"diff": [{"f2": 3500.0}]}}
+check(hasattr(_F, "_em_usable"), "feeds 缺 _em_usable()（东财值级判据）")
+check(not _F._em_usable(_null),
+      "f2=null 被判成东财可用 —— 零价格算健康，[数据源]会长期假绿")
+check(_F._em_usable(_good), "f2=3500 被判成不可用（判据过严）")
+check(not _F._em_usable(None), "None 被判成可用")
+# ⚠️光有函数不够 —— `health()`必须**真的调用**它。
+# 只测函数行为时，把调用点退回 `bool(M._has_data(d))` 也照样全绿（实测）。
+_fd_em = io.open(os.path.join(ROOT, "src", "feeds.py"),
+                 encoding="utf-8").read()
+check("if not _em_usable(d):" in _fd_em,
+      "health 没有用 _em_usable 判东财响应（接线断了）—— "
+      "值级判据写好但没接上，等于没修")
+
+# ----------⑤c 溯源必须逐台取，不得跨台 any() 聚合----------
+#
+# ⚠️2026-11-22：原实现 `any(_fb_used(...) for h in _em_hosts)` 会把
+# "第一台兜底成功但数据被判不合格"与"第二台直连成功"混成"只能靠兜底"。
+_fd2 = io.open(os.path.join(ROOT, "src", "feeds.py"),
+               encoding="utf-8").read()
+check("_em_fb = any(" not in _fd2,
+      "health 仍在跨台 any() 聚合兜底溯源 —— "
+      "第一台的兜底标记会污染第二台的直连结论")
+check("for _hi, _h in enumerate(_em_hosts):" in _fd2,
+      "health 没有逐台探测循环（无法逐台取溯源）")
+check("res[\"eastmoney_fallback\"] = True" in _fd2
+      and "_fb_prov" in _fd2,
+      "health 没有用逐台溯源变量 _fb_prov 决定 eastmoney_fallback")
 
 # ----------⑥旁路标记不影响 cj()的返回类型契约----------
 check(issubclass(M._RateLimited, BaseException) or

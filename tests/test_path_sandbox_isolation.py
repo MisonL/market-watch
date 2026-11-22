@@ -61,7 +61,9 @@ import paths # noqa: E402
 check(callable(getattr(paths, "refresh", None)),
  "paths没有 refresh() ——沙箱无法在运行期改根")
 
-_orig = paths.DIR
+# ⚠️`refresh()` 现在会把根走一遍 `abspath`（吃掉 `//` 之类冗余），
+# 所以"原根"也按同样口径归一化再比较，否则判定的是字符串差异不是行为。
+_orig = os.path.abspath(paths.DIR)
 _tmp = tempfile.mkdtemp(prefix="mw_iso_")
 try:
 	# ----------②refresh后 p_*全部转向新根----------
@@ -85,23 +87,95 @@ try:
 	check(sorted(os.listdir(_tmp)) == _before,
 	      "refresh()创建了文件/目录（应当只改变量）")
 
-	# ----------⑤已 import的消费方跟着转----------
+	# ----------⑤已 import的消费方跟着转（含**派生常量**）----------
+	#
+	# ⚠️2026-11-22：这一段原来只查 `runlog.RUNS/PUSHES` 两个名字，
+	# 于是「同步只覆盖了一部分常量」这个缺陷**测不出来**：
+	# 把 `paths._resync` 整个换成空函数，本文件**依然全绿**（实测）。
+	# 那说明当时守的是"paths 自己的 p_* 函数"，不是"已加载模块真的被改"。
+	#
+	# 现在改成：先把消费方**全部 import 进来**，再刷新，
+	# 然后要求**派生常量**（心跳、行情缓存、成分股缓存）也一起迁走。
+	# 只查一两个名字的判据等于没有判据 —— 漏改的那个正好不在名单里。
+	import marketlib as _M
 	import runlog as _R
-	_old_run = getattr(_R, "PUSHES", "")
-	if _old_run:
-		check(_old_run.startswith(_tmp),
-		 f"runlog.PUSHES没跟着 refresh转：{_old_run}"
-		 " ——它用 `from paths import HIST_DIR`拷了值，"
-		 "写流水会落回生产根")
-	check(getattr(_R, "RUNS", "").startswith(_tmp),
-	      f"runlog.RUNS没跟着 refresh转：{getattr(_R, 'RUNS', '')}")
+	import hot as _H
+	# ⚠️关键：模块是在 `_tmp` 下 import 的，它们的常量**本来就在 _tmp**。
+	# 要证明"同步真的发生了"，必须再迁到**第三个根** `_tmp2`，
+	# 否则 `startswith(_tmp)` 恒真 —— 同步完全失效也照样通过（实测踩到）。
+	_tmp2 = tempfile.mkdtemp(prefix="mw_iso2_")
+	paths.refresh(_tmp2)
+	_fails = []
+	for _nm, _mod in (("runlog.RUNS", _R.RUNS),
+	                   ("runlog.PUSHES", _R.PUSHES),
+	                   ("runlog.BEAT_FILE", _R.BEAT_FILE),
+	                   ("marketlib.DCACHE_FILE", _M.DCACHE_FILE),
+	                   ("marketlib.CACHE_DIR", _M.CACHE_DIR),
+	                   ("hot.CACHE", _H.CACHE)):
+		if not str(_mod).startswith(_tmp2):
+			_fails.append(f"{_nm}={_mod}")
+	check(not _fails,
+	      "这些常量没迁到新根（仍写旧沙箱）：" + ", ".join(_fails))
+	
+	# 「同步一整个失效」必须能被抓住：把 _resync 换成空函数，
+	# 至少要有一个路径常量留在旧根（否则这条判据是装饰）。
+	_orig_resync = paths._resync
+	try:
+		paths._resync = lambda *a, **k: None
+		paths.refresh(_orig)
+		# 停掉同步后，常量应**仍停在切换前的根**（_tmp）——那才是"没迁移"。
+		_stale = [n for n in ("RUNS", "PUSHES", "BEAT_FILE")
+		          if str(getattr(_R, n, "")).startswith(_tmp2)]
+		check(bool(_stale),
+		      "把 _resync 停掉后居然没有任何常量停在旧根 —— "
+		      "说明这段测的不是重绑定，换个名字就抓不到了")
+	finally:
+		paths._resync = _orig_resync
+		paths.refresh(_tmp2)
+	check(str(_R.BEAT_FILE).startswith(_tmp2),
+	      "恢复 _resync 后 BEAT_FILE 没回到沙箱根")
+	
+	# ----------⑤b 边界：兄弟目录不得被当成本根内的路径----------
+	#
+	# `[实测]` old_dir="/tmp/mw" 时 "/tmp/mw-probe/runs.jsonl" 会被裸
+	# startswith 判成旧根内并被覆盖 —— 一个外部桩被抹成部署流水路径。
+	# 兄弟目录必须相对**当前根**构造：判据比的是"是否落在当前根下"。
+	# 写成 _orig 的兄弟会永远不匹配，那种用例形同虚设（实测踩到）。
+	# 兄弟目录必须相对**当前根**构造：判据比的是"是否落在当前根下"。
+	# 写成 _orig 的兄弟会永远不匹配，那种用例形同虚设（实测踩到）。
+	_sib = _tmp2 + "-probe/runs.jsonl"
+	_keep_runs = _R.RUNS
+	# ⚠️必须**换到另一个根**才触发重定根：old==new 时 `_resync` 提前返回，
+	# 这一步等于空转 —— 那样就连裸 startswith 的旧缺陷也测不出来。
+	_tmp3 = tempfile.mkdtemp(prefix="mw_iso3_")
+	try:
+		_R.RUNS = _sib
+		paths.refresh(_tmp3)
+		check(_R.RUNS == _sib,
+		      f"兄弟目录的桩被覆盖了：{_sib} → {_R.RUNS} —— "
+		      "外部探针的写入会落到部署流水里")
+	finally:
+		_R.RUNS = _keep_runs
+		paths.refresh(_tmp2)
+	
+	# ----------⑤c 空值/空白必须拒绝（与 import 期同一套 fail-closed）----------
+	for _bad in ("", "   "):
+		try:
+			paths.refresh(_bad)
+			check(False, f"refresh({_bad!r}) 没有拒绝 —— "
+			      "会静默留在旧根，或把空白当根生成相对路径")
+		except SystemExit:
+			_ok[0] += 1
+	check(paths.DIR == _tmp2, "拒绝空值后 DIR 被改动了")
+	
 finally:
 	os.environ.pop("MW_DIR", None)
 	# ⚠️必须**显式**传回原目录：refresh()不传参时读 MW_DIR，
 	#而它刚被 pop ——于是回落到生产根。套件内原目录是 run_all给的
 	#沙箱，单独跑时才是生产根，两种情形都得恢复成"原来那个"。
 	paths.refresh(_orig)
-	check(paths.DIR == _orig, f"恢复后 DIR应为 {_orig}，实得 {paths.DIR}")
+	check(os.path.abspath(paths.DIR) == _orig,
+	      f"恢复后 DIR应为 {_orig}，实得 {paths.DIR}")
 
 # ----------⑥三个 push测试的沙箱顺序----------
 #
