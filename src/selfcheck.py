@@ -5942,7 +5942,18 @@ def _main(ok_all):
                 _bad22.append(f"195 条历史推送里有 {_fp22} 条被 DSML 判据误判 —— "
                               f"正常推送会被白跑一次重写")
         except Exception as _e22:
-            _bad22.append(f"历史推送回放失败: {type(_e22).__name__}: {_e22}")
+            #⚠️2026-11-22：「文件不存在」≠「文件坏了」。
+            # 全新安装（docker compose 第一天 / git clone 后首跑）没有
+            # pushes.jsonl，195 条历史回放无从谈起；但 DSML判据本体
+            #（①③④）不依赖历史文件，缺文件只是让第② 条（历史误判
+            #统计）本轮没跑 —— 未验证 ≠失败，不能置红。文件在却读
+            #不出来（权限/损坏）才是真❌。
+            if not os.path.exists(p_hist("pushes.jsonl")):
+                _unverified[0] +=1
+                print("ℹ️ 还没有 pushes.jsonl（全新安装/从未推送过）"
+                      " —— DSML历史误判统计本轮未验证")
+            else:
+                _bad22.append(f"历史推送回放失败: {type(_e22).__name__}: {_e22}")
         # ③ 剥离链必须**真的**把它作废（接线，不只是判据存在）
         import inspect as _inspect22
         _src22 = _inspect22.getsource(_A22.ai_analyze)
@@ -16812,11 +16823,22 @@ def _main(ok_all):
                 _runs_dt = datetime.datetime.strptime(
                     (_last16_j.get("t") or ""), "%Y-%m-%d %H:%M:%S")
         except Exception as _e16a:
-            _runs_read_fail = True
-            print(f"  ❌ 读不出 runs.jsonl 末条记录: "
-                  f"{type(_e16a).__name__}: {_e16a}")
-            print("     （执行流水是面板与事后审计的地基，必须可读）")
-            ok_all = False
+            # ⚠️ 2026-11-22：「文件不存在」≠「文件坏了」。
+            # 全新安装（`docker compose up` 第一天、或 `git clone` 后第一次跑）
+            # 根本没有 runs.jsonl，原写法在这里报 ❌ 并把 ok_all 置红 ——
+            # 于是**刚装好的系统自检就是红的**，用户第一眼看到的是
+            # 「执行流水是面板与事后审计的地基，必须可读」，却无从修起。
+            # 缺文件 = 还没有流水 = 本轮未验证；文件在但读不出来才是 ❌。
+            if not os.path.exists(_runs_p):
+                _unverified[0] += 1
+                print("  ℹ️  还没有 runs.jsonl（全新安装/从未落流水）"
+                      " —— 本项本轮未验证")
+            else:
+                _runs_read_fail = True
+                print(f"  ❌ 读不出 runs.jsonl 末条记录: "
+                      f"{type(_e16a).__name__}: {_e16a}")
+                print("     （执行流水是面板与事后审计的地基，必须可读）")
+                ok_all = False
         # 独立锚：watch.log 末条带时间戳的行（`[MM-DD HH:MM:SS] …`，无年份）
         #
         # ⚠️ 路径必须**自己拼 DIR/watch.log**，不能读 `M.LOG` ——
