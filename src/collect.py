@@ -34,6 +34,12 @@ try:
     from paths import DIR  # noqa: E402  （路径单一真值源，见 src/paths.py）
     from paths import p_state, p_log, p_hist
     from paths import LAUNCHD_PREFIX as _LD_PREFIX  # noqa: E402  （标签前缀可配置）
+    # ⚠️2026-11-22：**入口处重算一次**。`paths.DIR`在 import时固化，
+    #而本模块可能被先 import过 paths（旧 MW_DIR）——重算保证
+    #本进程的 DIR与本进程的环境变量一致，不写错树。
+    import paths as _paths_mod # noqa: E402
+    _paths_mod.refresh()
+    DIR = _paths_mod.DIR
 except Exception as _paths_e:      # noqa: BLE001
     # ⚠️ 2026-11-01 修（P2）同 analyze.py：paths.py 不能拖死入口，
     # 否则采集停摆而 logs/history 零留痕。回退到本地最小路径推导。

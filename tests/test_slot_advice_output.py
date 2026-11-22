@@ -244,10 +244,18 @@ def t_ast_wiring():
 
 
 def _load_analyze_sandbox():
-    """在临时 MW_DIR 里加载 analyze（不碰生产 state，不调 AI）。"""
+    """在临时 MW_DIR里加载 analyze（不碰生产 state，不调 AI）。"""
     _tmp = tempfile.mkdtemp(prefix="mw_adv_")
     os.environ["MW_DIR"] = _tmp
-    for m in [m for m in list(sys.modules) if m in ("analyze", "marketlib")]:
+    # ⚠️2026-11-22（P0写穿生产）：**必须**先 refresh paths。
+    # `paths.DIR`在 import时固化；只 pop analyze/marketlib而不刷新
+    # paths，则 `p_hist("pushes.jsonl")`仍指向生产根 ——
+    # `A.push()`会把合成数据（板块0…板块59）写进**生产**
+    # pushes.jsonl并标记 ok:true。实测2026-11-19 /11-22各一次。
+    import paths as _paths
+    _paths.refresh()
+    for m in [m for m in list(sys.modules)
+        if m in ("analyze", "marketlib", "runlog")]:
         sys.modules.pop(m, None)
     import analyze
     return analyze

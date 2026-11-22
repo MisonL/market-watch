@@ -52,6 +52,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # src/
 try:
     from paths import DIR  # noqa: E402  （路径单一真值源，见 src/paths.py）
     from paths import p_state, p_log, p_conf, p_hist
+    # ⚠️2026-11-22：入口处重算一次，理由同 collect.py ——
+    #`paths.DIR`在 import时固化，先 import paths者决定它。
+    import paths as _paths_mod # noqa: E402
+    _paths_mod.refresh()
+    DIR = _paths_mod.DIR
+    p_state = _paths_mod.p_state
+    p_log = _paths_mod.p_log
+    p_conf = _paths_mod.p_conf
+    p_hist = _paths_mod.p_hist
 except Exception as _paths_e:      # noqa: BLE001 —— 兜底必须接住一切
     # ⚠️ 2026-11-01 修（P2）：分层后 `paths.py` 成了**新的单点故障**。
     # 它原先在依赖导入兜底（下方 try，只包 marketlib/runlog）之外 ——

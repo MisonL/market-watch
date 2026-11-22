@@ -40,6 +40,120 @@ LOGS_DIR  = os.path.join(DIR, "logs")
 CACHE_DIR = os.path.join(STATE_DIR, "cache")
 HIST_DIR  = os.path.join(STATE_DIR, "history")
 
+_LAYER_SUBDIRS = {
+    "CONF_DIR": ("conf",),
+    "STATE_DIR": ("state",),
+    "LOGS_DIR": ("logs",),
+    "CACHE_DIR": ("state", "cache"),
+    "HIST_DIR": ("state", "history"),
+}
+
+#这些模块用 `from paths import X`拷走了常量值，refresh时必须同步。
+#漏一个的后果 =该模块继续写旧根（「闸门在 ≠闸门生效」的老形态）。
+_RESYNC_TARGETS = {
+    "runlog": ("HIST_DIR", "RUNS", "PUSHES"),
+    "marketlib": ("CACHE_DIR", "LOGS_DIR"),
+}
+
+
+def _resync(vals, old_dir=None):
+    """把新路径值写回已 import的消费方模块；失败静默。
+
+    ⚠️**只改仍指向旧根的值**。这条约束是自检当场逼出来的：
+    `selfcheck`的 `[执行流水新鲜度]`会把 `runlog.RUNS`桩到临时文件
+    （否则会往生产流水塞假记录），然后还原。若 `refresh()`无条件把
+    `RUNS`改回 `HIST_DIR/runs.jsonl`，桩就被**改穿**了：
+    `[桩泄漏]`一律报「runlog.RUNS被桩掉后未还原」，
+    而实际是 refresh在还原**之后**才跑。
+
+    判据：当前值以 `old_dir`开头（=还在旧根下）才改写；
+    已被指向别处（桩/沙箱）的原样不动。
+    """
+    import sys as _sys
+    _hist = vals.get("HIST_DIR")
+    for _mod_name, _attrs in _RESYNC_TARGETS.items():
+        _m = _sys.modules.get(_mod_name)
+        if _m is None:
+            continue
+        for _a in _attrs:
+            try:
+                _cur = getattr(_m, _a, None)
+                if isinstance(_cur, str) and old_dir and \
+                not _cur.startswith(old_dir):
+                    continue #已被桩/指向别处，不动它
+                if _a in ("CONF_DIR", "STATE_DIR", "LOGS_DIR",
+                    "CACHE_DIR", "HIST_DIR"):
+                    _new_v = vals[_a]
+                elif _a == "RUNS" and _hist:
+                    _new_v = os.path.join(_hist, "runs.jsonl")
+                elif _a == "PUSHES" and _hist:
+                    _new_v = os.path.join(_hist, "pushes.jsonl")
+                else:
+                    continue
+                # ⚠️**值相同就不要赋值**。自检「桩泄漏」用 `is`（对象同一性）
+                #对账 `_SNAP0`，而 `os.path.join`每次调用都新建 str对象 ——
+                #即使内容一样，`is`也会判「被桩掉后未还原」。
+                if _cur == _new_v:
+                    continue
+                setattr(_m, _a, _new_v)
+            except Exception:
+                pass
+
+
+def refresh(new_dir=None):
+    """按 `MW_DIR`（或显式 `new_dir`）重算全部路径常量，并同步已导入方。
+
+    ##为什么要这个函数
+
+    `DIR`及五个子目录常量原先**只在 import时算一次**。而
+    `runlog.py` / `marketlib.py` / `hot.py`写的是
+    `from paths import HIST_DIR, CACHE_DIR …` ——那是**值拷贝**，
+    之后 `paths.DIR`再变也不会跟着变。
+
+    于是「先 import paths、后设 MW_DIR」的顺序会**静默写穿生产根**。
+
+    `[实测]`2026-11-22复现 ——设 `MW_DIR=$(mktemp -d)`后
+    `analyze.p_hist("pushes.jsonl")`仍返回
+    `/Users/…/.market-watch/state/history/pushes.jsonl`，一次
+    `analyze.push()`就往**生产** `pushes.jsonl`追加了一条合成记录，
+    并标记 `ok: true`。
+
+    `run_all.sh`每个测试用**独立子进程**并先设 `MW_DIR`，所以批量跑
+    时不暴露；**单独 `python3 tests/xxx.py`就会写穿** ——
+    「本地绿 ≠安全」：沙箱在批量路径上有效，在单跑路径上失效。
+
+    ##契约
+
+    ·只改变量，不动已有文件 ——绝不创建/删除任何路径；
+    ·幂等：重复调用结果相同；
+    ·同步已 import的 `paths`消费方（`_RESYNC_TARGETS`）；
+    ·不抛异常（调用点在测试/启动路径上）。
+    """
+    global DIR, CONF_DIR, STATE_DIR, LOGS_DIR, CACHE_DIR, HIST_DIR
+    try:
+        _new = new_dir
+        if _new is None:
+            _env = os.environ.get("MW_DIR")
+            _new = (_env if _env is not None
+            else os.path.expanduser("~/.market-watch"))
+        if not _new:
+            return DIR
+        _old_dir = DIR
+        DIR = _new
+        _vals = {"DIR": DIR}
+        for _name, _parts in _LAYER_SUBDIRS.items():
+            _vals[_name] = os.path.join(DIR, *_parts)
+        CONF_DIR = _vals["CONF_DIR"]
+        STATE_DIR = _vals["STATE_DIR"]
+        LOGS_DIR = _vals["LOGS_DIR"]
+        CACHE_DIR = _vals["CACHE_DIR"]
+        HIST_DIR = _vals["HIST_DIR"]
+        _resync(_vals, _old_dir)
+        return DIR
+    except Exception:
+        return DIR
+
+
 
 def p_conf(name):
     return os.path.join(CONF_DIR, name)

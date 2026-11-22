@@ -22,9 +22,24 @@ import datetime
 import os
 import stat
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+
+# ⚠️2026-11-22（P0写穿生产）：本文件调 `A.push()`，但**原先没有任何沙箱**
+# ——import生产 analyze后，`push()`会把通知记录追加进**生产**
+# `state/history/pushes.jsonl`（实测11-22污染规模的排查即由此而来）。
+#必须在 import任何 src模块**之前**设 `MW_DIR`，并建好子目录。
+if not os.environ.get("MW_DIR"):
+    os.environ["MW_DIR"] = tempfile.mkdtemp(prefix="mw_af21_")
+_SANDBOX = os.environ["MW_DIR"]
+for _sub in ("state/history", "state/cache", "conf", "logs"):
+    os.makedirs(os.path.join(_SANDBOX, _sub), exist_ok=True)
+# ⚠️ makedirs按 umask建出755；下面有一条判据要求 state为0o700，
+#沙箱自己也得合规，否则测的是自己的疏漏而不是被测代码。
+for _sub in ("state", "state/history", "state/cache", "conf", "logs"):
+    os.chmod(os.path.join(_SANDBOX, _sub),0o700)
 
 import marketlib as M # noqa: E402
 import analyze as A # noqa: E402
