@@ -2146,7 +2146,7 @@ def detect(q, sg, now, st):
         v2, v3 = _num(v.get("f2")), _num(v.get("f3"))
         if _hk_live:
             if v2 is not None and v2>=th: hits.append(("hstech_up", f"恒生科技{v2}≥{th}"))
-            dn = T("hstech_down", 3482.43)
+            dn = T("hstech_down", 3395.38)
             if v2 is not None and v2<=dn: hits.append(("hstech_down", f"恒生科技{v2}≤{dn}"))
             dr = T("hstech_drop", -1.5)
             if v3 is not None and v3<=dr: hits.append(("hstech_drop", f"恒生科技{v3:+.2f}%"))
@@ -2869,7 +2869,7 @@ def build_brief(q, sg, hits, now, hot=None, slot=None):
         # 等于把被禁的词根喂给 AI，与规则自相矛盾。
         L.append(f"  [观察触发线] 恒生科技 上方 {th_h}"
                  f"（距离 {(th_h/v['f2']-1)*100:+.2f}%），"
-                 f"下方 {threshold('hstech_down',3482.43)}")
+                 f"下方 {threshold('hstech_down',3395.38)}")
 
     # deadline 时段专用：告诉 AI「今天之后还有几个可操作的交易日」。
     # deadline slot 的 rule 要求它按实际紧迫程度措辞，但原先 brief 里

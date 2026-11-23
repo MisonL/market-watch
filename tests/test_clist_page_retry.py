@@ -81,6 +81,15 @@ class _Harness:
         M._https_hosts = lambda: ["https://stub.invalid/api/qt"]
         M.log = lambda msg, kind=None: self.logs.append(str(msg))
         M.data_cap = lambda b, what=None: b
+        # ⚠️⚠️ 必须把 firecrawl 冷却也桩掉。
+        # `clist()` 现在会判 `_fc_fail_get()`：冷却期内**跳过重试**
+        # （此时 `cj()` 会 0.0s 空回，重试只是白打）。
+        # 而 `_fc_fail_get()` 读的是 `state/cache/firecrawl_fail.json` ——
+        # 不桩就是读**生产**状态：机器上刚好在限流冷却时，本文件
+        # 会突然从"重试后取全"变成"只拿到 400 条"，红得莫名其妙
+        # （实测踩到，且当时误以为是代码坏了）。
+        self._orig_fc = M._fc_fail_get
+        M._fc_fail_get = lambda: 0.0
         return self
 
     def __exit__(self, *a):
@@ -88,6 +97,7 @@ class _Harness:
         M._https_hosts = self.orig_hosts
         M.log = self.orig_log
         M.data_cap = self.orig_budget
+        M._fc_fail_get = self._orig_fc
         return False
 
     def _cj(self, url, **kw):
@@ -270,6 +280,25 @@ check(any("重试前预算已耗尽" in s for s in h.logs),
       "页内重试时预算耗尽没留痕（会被误报成源故障）：" + repr(h.logs))
 check(any("不是源坏了" in s for s in h.logs),
       "预算耗尽的日志没点明这不是源坏了：" + repr(h.logs))
+
+# ---------- ③f firecrawl 冷却期内 -> 不重试，且不得谎称试过 ----------
+#
+# ⚠️2026-11-23：直连被 DPI 拦死、代理未配，firecrawl 一进冷却，`cj()` 会在
+# 0.0s 内空回（不发任何请求）。此时重试 N 次只是把同一页白打 N 遍，
+# 还会让"名单不完整"晚 N 倍时间才报。实测一轮 13 次 clist 请求全是空转。
+#
+# 更忌讳的是**编造没发生的事**：若用 `range(0)` 表达"不重试"，
+# `for...else` 会在空循环时立刻执行 else，日志变成"重试 2 次仍失败" ——
+# 而一次都没试过。必须直接说真实原因。
+with _Harness(fail_times=99) as h:
+    M._fc_fail_get = lambda: time.time() + 300     # 冷却中
+    got9 = M.clist("m:90+t:3", "f12", pz=500, max_pn=12, fid="f62",
+                   budget_s=180)
+check(any("firecrawl 正在冷却" in s for s in h.logs),
+      "冷却期内没说明真实原因：" + repr(h.logs))
+check(not any("仍失败" in s for s in h.logs),
+      "冷却期内一次都没重试，却报了『重试 N 次仍失败』—— 在编造没发生的事："
+      + repr(h.logs))
 
 # ---------- ④反面控制：把重试关掉，①必须变红 ----------
 _orig_retry = M._PAGE_RETRY

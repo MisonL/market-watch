@@ -385,12 +385,16 @@ TH: Thresholds = {
     # 任何已过期的样例键（原先留了 hstech_up_0922 "作格式参考"，
     # 但它永远不会再被读到，只会让审阅者以为是活配置）。
     # 要设置某日的专用触发线，在 sectors.json 的 thresholds 里加即可。
-    # ⚠️ 2026-11-20 同步：今日盘中恒科创 52 周新低 3482.43，配置已从
+    # ⚠️ 2026-11-20 同步：当日盘中恒科创 52 周新低 3482.43，配置已从
     # 3630 重校准到 3482.43（旧线高于现价会退化成每日常中）。
+    # ⚠️ 2026-11-23 再同步：当日盘中再创新低 **3395.38**，配置已从
+    # 3482.43 重校准到 3395.38 —— 旧线当日被两次触及后收回（09:38/09:47 报案），
+    # 留在上方只会退化成噪声。**这条链已经连续两次重校准**，底下那句
+    # "必须手工同步"的结论依然成立：靠人记住是不行的。
     # 本条注释上方的规矩（重校准后必须手工同步本表 + 三处字面默认值）
     # 这次**又被漏做**，是 `[阈值兜底一致性]` 当场抓出来的 ——
     # 说明"靠人记得"这个机制不可靠，但当前结构只能如此（配置是活真值）。
-    "hstech_down": 3482.43,
+    "hstech_down": 3395.38,
     "hstech_drop": -1.5,      # 恒生科技单日跌幅（原先硬编码在 analyze.py）
     # 存储冲高回落
     "storage_fade": -1.5,     # 自日内高点回落
@@ -2429,7 +2433,39 @@ def firecrawl_get(url, timeout=None):
     _to = timeout or FIRECRAWL_TIMEOUT
     try:
         r = subprocess.run(
-            [_FIRECRAWL_NODE, _FIRECRAWL_CLI, "scrape", "--format", "rawHtml", url],
+            # ⚠️⚠️ 2026-11-23（P0，数据正确性）：**必须 `--max-age 0` 禁掉云端缓存**。
+            #
+            # `[实测]` firecrawl CLI 默认**按 URL 缓存**响应。行情 URL
+            # （同一批 secids + 同一串 fields）**每轮完全一样**，于是第一次
+            # 兜底成功之后，后续每一轮拿到的都是**同一份旧响应**，
+            # 而 `quotes()` 看到的是"完整的、新鲜的、有限正数"的行情 ——
+            # `_valid_quotes` / 新鲜度闸门**全部拦不住**（时间戳也是旧的但
+            # 没有任何闸门拿它跟墙上时钟比）。
+            #
+            # 当天后果（2026-11-23，生产实据）：
+            #   10:51 第一次走 firecrawl 兜底，缓存了当时的行情
+            #   10:51 ~ 15:07 每一轮都返回这份缓存
+            #   -> 15:07「收盘定局」播报：上证 -1.39%（3484.63）、
+            #      创业板指 -0.59%（2199.12）、成交 2798 亿
+            #   而真实收盘：上证 **+0.15%**（3538.95）、
+            #      创业板指 **+3.08%**（2280.20）、成交 **7385 亿**
+            #   方向完全反了 —— 涨被报成跌，用户拿新闻一对就发现了。
+            #
+            # 证据（同一 URL，唯一差别是有无缓存破坏参数）：
+            #   原样              -> f2=3484.63 f3=-1.39   ← 10:51 的旧值
+            #   &_cb=zz9911      -> f2=3538.95 f3=+0.15   ← 真值
+            #   --max-age 0       -> f2=3538.95 f3=+0.15   ← 真值（采用这个）
+            #
+            # 为什么是 P0 而不是"数据略旧"：缓存让**陈旧数据伪装成实时数据**，
+            # 而本仓库所有闸门（完整性/合理性/新鲜度）都只检查"形状对不对"，
+            # 没有一条检查"这是不是几分钟前那份"。禁用缓存是唯一正确的修法 ——
+            # 兜底层的价值就是"拿到此刻的真值"，缓存直接摧毁了这个前提。
+            #
+            # ⚠️ 不加缓存破坏参数（`&_cb=`）而用 `--max-age 0`：
+            # 前者会让 URL 每轮都不同，白白打穿 firecrawl 的**正常**去重，
+            # 也无谓地拉长 URL；后者是官方语义，明确表达"不要缓存"。
+            [_FIRECRAWL_NODE, _FIRECRAWL_CLI, "scrape", "--format", "rawHtml",
+             "--max-age", "0", url],
             capture_output=True, text=True, timeout=_to)
     except Exception as e:
         log(f"firecrawl 调用异常: {type(e).__name__}: {e}", "FEED")
@@ -4918,7 +4954,17 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
         )
         if _need:
             _gave_up_for_budget = False
-            for _try in range(_PAGE_RETRY):
+            # ⚠️⚠️ 2026-11-23（P1 放大器）：**firecrawl 冷却期内重试毫无意义**。
+            # 直连已被 DPI 拦死，代理默认没配，firecrawl 一进冷却，
+            # `cj()` 会在 0.0s 内空回（不发任何请求）—— 此时重试 2 次
+            # 只是把同一页白打 3 遍，且让出口的"名单不完整"晚 3 倍时间才报。
+            # 当天实测 14:31 一轮里 13 次 clist 请求全是这种空转。
+            _fc_cooling = time.time() < _fc_fail_get()
+            if _fc_cooling:
+                log(f"clist({fs}) 第 {pn} 页失败，但 firecrawl 正在冷却"
+                    f"（限流/故障），重试无意义，直接放弃该页", "FEED")
+            _tried = 0
+            for _try in range(0 if _fc_cooling else _PAGE_RETRY):
                 if budget_s is not None and time.monotonic() - _t0 > budget_s:
                     # ⚠️（2026-11-23 codex P1）这条 `break` 会**跳过 `for...else`**，
                     # 于是"重试用尽"不打印。若不在此处单独记一笔，出口只会看到
@@ -4928,6 +4974,7 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
                         f"（{time.monotonic() - _t0:.1f}s > {budget_s}s），放弃重试"
                         f" —— 这是**预算**不够，不是源坏了", "FEED")
                     break
+                _tried += 1
                 _was_empty = not _inner     # 记下这次是空包还是短页，供日志区分
                 d = None
                 for host in _https_hosts():
@@ -4942,9 +4989,14 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
                         f"{_try+1}/{_PAGE_RETRY} 成功", "FEED")
                     break
             else:
-                log(f"clist({fs}) 第 {pn} 页重试 {_PAGE_RETRY} 次仍失败"
-                    f"（缺口由出口处统一报，此处不重复记已取的 {len(out)} 条）",
-                    "FEED")
+                # ⚠️ `for...else` 在**空循环**时也会执行 —— 冷却期用 `range(0)`
+                # 表达"不重试"时，这里会打「重试 2 次仍失败」，而实际一次都没试过。
+                # 那是在编造没发生的事（本仓库最忌讳的形态）。
+                # 用 `_tried` 卡死：只有真试过才允许这么说。
+                if _tried:
+                    log(f"clist({fs}) 第 {pn} 页重试 {_tried} 次仍失败"
+                        f"（缺口由出口处统一报，此处不重复记已取的 "
+                        f"{len(out)} 条）", "FEED")
         if not _inner:
             break
         # ⚠️ diff 有**两种形状**：list，或 dict（键为序号字符串）。
@@ -5006,6 +5058,74 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
     # 自己拿到的是完整名单还是截断的部分** ——
     # `hot.members()` 于是把残缺名单当完整缓存 7 天。
     return (out, _total) if with_total else out
+
+def clist_extremes(fs, fields, fabs, pz=100, pages=2, budget_s=None):
+    """只取**资金两端**（流入榜头 + 流出榜头），供异动判定用。
+
+    为什么需要这个函数（`[实测]` 2026-11-23 盘中）：
+    服务端把 `pz` 硬截到 **100 行**（`pz>=200` 直接返回 0 行），
+    所以全量 496 个行业 / 554 个概念各要 5~6 页 —— 一次全量扫描
+    就是 **11 次请求**。而经 firecrawl 兜底时额度只有 **12 次/分钟**，
+    一次全量就把整分钟额度吃光。当天实测：每一轮都在第 4~6 页限流，
+    行业缺 96 个、概念缺 54~354 个，`alert` 两个 `_sector_rows`
+    全部返回 0 条 -> 推送里 12 个关注板块整段「数据暂缺」。
+
+    但异动判定的门槛是 `|f62| >= fabs`（默认 50 亿），**只需要尾部**：
+    `po=1` 按 f62 降序拿流入最大的，`po=0` 升序拿流出最大的。
+    末尾（最小 |f62|）一旦低于门槛，后面的行必然更小，可以安全停。
+
+    ⚠️ 每个方向**只调一次** `clist`，靠它内部的 `max_pn` 翻页。
+    踩过：写成 `for _cap in (pages, pages*2)` 渐进加码，第二次调用会把
+    第一页**重新取一遍** —— 实测 10 次请求，比全量的 11 次几乎没省。
+
+    返回 `(rows, complete)`：
+      · `rows`     —— 两方向已取到的行，按 `f12` 去重（保留先到的）
+      · `complete` —— 是否**确认**取全了所有超门槛的板块。
+        任一方向取不到、或末尾仍超门槛、或预算耗尽 -> `complete=False`，
+        调用方必须据此降级（标记本轮不完整），**不得**当真取全了。
+    """
+    out = []
+    seen = set()
+    complete = True
+    _t0 = time.monotonic()
+    for _po, _label in ((1, "流入"), (0, "流出")):
+        if budget_s is not None and time.monotonic() - _t0 > budget_s:
+            log(f"clist_extremes({fs}) 预算耗尽于{_label}方向之前，"
+                f"该方向未取", "FEED")
+            complete = False
+            break
+        _got = clist(fs, fields, pz=pz, max_pn=pages, fid="f62",
+                     po=_po, budget_s=budget_s)
+        _got = [r for r in (_got if isinstance(_got, list)
+                            else list((_got or {}).values()))
+                if isinstance(r, dict)]
+        _vals = [r.get("f62") for r in _got if isnum(r.get("f62"))]
+        # ⚠️⚠️ 空结果**不能**当作"这个方向没有超门槛板块"。
+        # `[实测]` 2026-11-23：firecrawl 限流时该方向整段返回 0 条，
+        # 而 `not _vals` 会让流程继续并**保持 complete=True** ——
+        # "一条都没取到"被报成"确认取全了"，下游照常当作完整名单使用，
+        # 12 个关注板块整段缺失却没人知道。
+        # 这正是本仓库反复修的「判据写在注释里、没写在代码里」。
+        if not _vals:
+            log(f"clist_extremes({fs}) {_label}方向**一条都没取到** —— "
+                f"无法确认该方向有无超门槛板块", "FEED")
+            complete = False
+        elif min(abs(v) for v in _vals) >= fabs:
+            # 末尾仍超门槛：可能还有超门槛板块没进这一页范围
+            log(f"clist_extremes({fs}) {_label}方向取到 {len(_got)} 行后"
+                f"末尾仍超门槛（{min(abs(v) for v in _vals)/1e8:.1f}亿"
+                f" >= {fabs/1e8:.0f}亿）—— 可能还有未取到的超门槛板块",
+                "FEED")
+            complete = False
+        for r in _got:
+            k = r.get("f12")
+            if isinstance(k, str) and k:
+                if k in seen:
+                    continue
+                seen.add(k)
+            out.append(r)
+    return out, complete
+
 
 def clist_available():
     """探测 clist 是否可用。与 clist() 一致，含主机故障转移。"""
