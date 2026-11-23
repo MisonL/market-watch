@@ -567,6 +567,57 @@ def _ai_fallback_verdict(n_fb, n_ai, stalls=None):
 _AI_STALL_BUDGET = ("budget", "budget-skip")
 
 
+def _ai_budget_vs_data(data_ms_list, round_budget):
+    """把「budget 掐停」的兜底轮再分成两类，**决定措辞往哪指**。
+
+    返回 `(n_data_bound, n_ai_bound, n_unknown)`：
+
+      · `n_data_bound` —— 取数吃掉了**一半以上**的单轮预算。
+        这类轮次 AI 拿到的预算被压得很扁，「取数太慢」是**真的**主因。
+      · `n_ai_bound`   —— 取数占比很小（< 40%），AI 手里预算充足却仍然超时。
+        这类轮次的主因是 **AI 自身耗时**（模型慢 / 想太久），
+        跟取数快慢无关 —— 去查 `data_ms` 什么也查不出来。
+      · `n_unknown`    —— 没有 `data_ms` 记录（老流水），判不了。
+
+    为什么必须分（`[实测]` 2026-11-23）：
+        当日 7 轮兜底全是 `budget` 掐停，自检一律写
+        「是『全轮预算 240s − 取数耗时』把它压没了」并让运维去查 `data_ms`。
+        但实际取数耗时是：
+
+            1.3s  3.2s  23.6s  31.9s  55.2s  74.2s  122.5s
+
+        只有最后 1 轮（122.5s，占 51%）是真的被取数压的。
+        前 5 轮取数只占 0.6%~23%，AI 拿到 185~239s 预算**照样超时** ——
+        照那条提示去查 `data_ms`，查到的是 1.3 秒，什么线索都没有，
+        而真正该看的是「这一轮 AI 为什么跑了 240 秒还没写完」。
+
+    ⚠️ 阈值取 50% / 40% 而不是「取数 > AI」：预算本来就是你多我少
+    （`AI 预算 = 240 - 取数`），取数只要到 120s 就已经是"AI 只剩一半"，
+    这时说"取数压没了"是公允的；而取数 30s（占 12.5%）时 AI 还有 210s，
+    再怪取数就是**归因错误**。两档之间留 10% 缓冲，避免卡在边界上的
+    轮次来回跳。
+    """
+    _d = _a = _u = 0
+    for _ms in (data_ms_list or []):
+        try:
+            _ds = float(_ms) / 1000.0
+        except (TypeError, ValueError):
+            _u += 1
+            continue
+        if _ds < 0 or round_budget is None or round_budget <= 0:
+            _u += 1
+            continue
+        _share = _ds / float(round_budget)
+        if _share >= 0.5:
+            _d += 1
+        elif _share < 0.4:
+            _a += 1
+        else:
+            _u += 1
+    return _d, _a, _u
+
+
+
 def _ai_stall_split(stalls):
     """把兜底轮的 `ai_stall` token 计数分成 (我方预算数, 其他数)。
 
@@ -17380,6 +17431,7 @@ def _main(ok_all):
         # 只有 2026-11-20 之后的流水才带这个键，老流水落到 "unknown" ——
         # 不参与「我方预算」判定，仍走原来的查网关措辞（向后兼容）。
         _stall_dl = {}
+        _fb_dms_dl = []          # 兜底轮的取数耗时（毫秒），供 _ai_budget_vs_data 用
         try:
             with open(_runs_dl, encoding="utf-8", errors="replace") as _f_dl3:
                 for _l_dl3 in _f_dl3:
@@ -17406,6 +17458,24 @@ def _main(ok_all):
                         # 模板，掺进来会让分母失真。
                         _sk_dl = _r_dl3.get("ai_stall") or "unknown"
                         _stall_dl[_sk_dl] = _stall_dl.get(_sk_dl, 0) + 1
+                        # ⚠️⚠️ 2026-11-23（P1 归因跑偏）：**必须记下每轮的
+                        # 取数耗时**，否则下面那句"取数耗时把它压没了"是在
+                        # 没有证据的情况下下的结论。
+                        #
+                        # `[实测]` 当日 7 轮全是 budget 掐停，但取数耗时是
+                        # **1.3s / 3.2s / 23.6s / 31.9s / 55.2s / 74.2s / 122.5s**
+                        # —— 前 5 轮取数只占全轮预算的 0.6%~23%，AI 拿到的
+                        # 预算高达 185~239s，**仍然全部超时**。
+                        # 也就是说那 5 轮真正的原因是「AI 自身耗时逼近/超过
+                        # 单轮预算」，跟取数快慢毫无关系。
+                        # 而自检当时一律写「是『全轮预算 240s − 取数耗时』把
+                        # 它压没了」并让运维去查 `data_ms` —— 把 5/7 的排查
+                        # 方向指错了地方（data_ms 只有 1.3s，查它什么也查不出）。
+                        #
+                        # 判据：记下 (取数耗时, 该轮 AI 预算) 两个数，
+                        # 由下方 `_ai_budget_vs_data` 决定措辞。
+                        if isinstance(_r_dl3.get("data_ms"), (int, float)):
+                            _fb_dms_dl.append(float(_r_dl3["data_ms"]))
                     # ⚠️ 2026-11-08（复核 F8）：「回退首版但结构仍缺段」的轮次。
                     # 这不是故障（回退是刻意的取舍：缺一段的真实内容优于
                     # 机械模板），但读者确实少看到一个段。原先它只在
@@ -17436,22 +17506,55 @@ def _main(ok_all):
                         sorted(_stall_dl.items(), key=lambda x: -x[1])[:4])
                     # ⚠️ 预算值的**真值**在 analyze，不在这里复制字面量
                     # （本仓库反复的坑：同一口径两处维护）。取不到就写"?"。
+                    # ⚠️ `_nb_dl` 必须**在同一个 try 里**算出来。
+                    # import 失败时 `_A_bq` 根本不存在，下面裸引用它会
+                    # NameError —— 而那句 NameError 会冒到外层的
+                    # `except Exception` 里，把整段 [模板兜底] 打成
+                    # "未验证"，反而比原来更差。
+                    _nb_dl = None
                     try:
                         import analyze as _A_bq
                         _rb_txt = ("不限制" if _A_bq.AI_ROUND_BUDGET is None
                                    else f"{_A_bq.AI_ROUND_BUDGET:.0f}s")
+                        if _A_bq.AI_ROUND_BUDGET is not None:
+                            _nb_dl = float(_A_bq.AI_ROUND_BUDGET)
                     except Exception:
                         _rb_txt = "?"
                     if _bq_dl > 0 and _bq_dl >= _oq_dl:
-                        _dl_bad.append(
-                            f"当日模板兜底 **{_n_fb_dl}/{_n_ai_dl} 轮**"
-                            f"（≥ 半数）—— 但掐停原因以**我方单轮预算**为主"
-                            f"（{_mix_dl}）：AI 通道没坏，是"
-                            f"「全轮预算 {_rb_txt} − 取数耗时」把它压没了，"
-                            f"慢轮还没写完就被自己掐掉。读者仍只拿到模板文案。"
-                            f"处置：查该轮 `data_ms`（取数吃了多少）、"
-                            f"或调 `AI_ROUND_BUDGET`/给取数加全局上限 —— "
-                            f"**不要去查网关**")
+                        # ⚠️⚠️ 2026-11-23（P1 归因跑偏）：**不能再一律怪取数**。
+                        # 见 `_ai_budget_vs_data` 的注释 —— 当日 7 轮里
+                        # 只有 1 轮的取数真的吃掉了过半预算，另 5 轮取数
+                        # 只占 0.6%~23%，AI 预算 185~239s 照样超时。
+                        # 照旧文案让人去查 `data_ms`，查到的是 1.3 秒，
+                        # 白跑一趟且把真正的嫌疑（AI 太慢）掩盖掉。
+                        _db_dl, _ab_dl, _ub_dl = _ai_budget_vs_data(
+                            _fb_dms_dl, _nb_dl)
+                        if _ab_dl > _db_dl:
+                            # 主因是 AI 自身耗时 —— 明确**不要**去查取数
+                            _dl_bad.append(
+                                f"当日模板兜底 **{_n_fb_dl}/{_n_ai_dl} 轮**"
+                                f"（≥ 半数）—— 掐停原因是我方单轮预算"
+                                f"（{_mix_dl}），但**取数不是主因**："
+                                f"{_ab_dl}/{_ab_dl + _db_dl} 轮取数占预算"
+                                f"不足 4 成，AI 手里还有大把时间仍然超时。"
+                                f"真因是**这一轮 AI 自己跑太久**（想太久/模型慢），"
+                                f"读者只拿到模板文案。"
+                                f"处置：查该轮 `ai_ms` 与原始字符数"
+                                f"（看是否空转到预算上限）、"
+                                f"考虑拆分 prompt 或缩短必答项 —— "
+                                f"**不要去查 `data_ms`（它只有几秒）、"
+                                f"更不要去查网关**")
+                        else:
+                            _dl_bad.append(
+                                f"当日模板兜底 **{_n_fb_dl}/{_n_ai_dl} 轮**"
+                                f"（≥ 半数）—— 但掐停原因以**我方单轮预算**为主"
+                                f"（{_mix_dl}）：AI 通道没坏，是"
+                                f"「全轮预算 {_rb_txt} − 取数耗时」把它压没了"
+                                f"（{_db_dl} 轮取数占预算过半），"
+                                f"慢轮还没写完就被自己掐掉。读者仍只拿到模板文案。"
+                                f"处置：查该轮 `data_ms`（取数吃了多少）、"
+                                f"或调 `AI_ROUND_BUDGET`/给取数加全局上限 —— "
+                                f"**不要去查网关**")
                     else:
                         _dl_bad.append(
                             f"当日模板兜底 **{_n_fb_dl}/{_n_ai_dl} 轮**"
