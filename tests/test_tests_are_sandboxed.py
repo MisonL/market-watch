@@ -108,11 +108,23 @@ try:
 
     # ---------- ③ 真的没写进生产日志 ----------
     # 探针已调用过 `M.log(...)`。若闸门没生效，这一行会落进生产 watch.log。
+    #
+    # ⚠️ CI 上**没有** `~/.market-watch/logs/watch.log`（那是本机的生产目录），
+    # 第一版直接断言"行数不变"于是在 CI 上必红：
+    #     ❌ 读不到生产 watch.log，无法验证
+    # 但那种环境下的正确判据是更强的那个：**它连文件都不许被建出来**。
+    # 闸门失效时 `_log` 会 `os.open(..., O_CREAT)` 凭空造出这个文件 ——
+    # 那比"多写一行"更能说明问题。
     _after = _nlines()
-    check(_before >= 0 and _after >= 0, "读不到生产 watch.log，无法验证")
-    check(_after == _before,
-          f"探针调用 `M.log()` 后生产 watch.log 从 {_before} 涨到 {_after} 行 —— "
-          f"写穿防线没生效")
+    if _before < 0:
+        check(_after < 0,
+              f"本机没有生产 watch.log（{_PROD_LOG}），但探针调用 `M.log()` "
+              f"之后它被**创建**出来了 —— 写穿防线没生效，"
+              f"而且是把线上目录凭空造出来")
+    else:
+        check(_after >= 0 and _after == _before,
+              f"探针调用 `M.log()` 后生产 watch.log 从 {_before} 涨到 "
+              f"{_after} 行 —— 写穿防线没生效")
 
     # ---------- ④ 不静默丢弃 ----------
     check("__logguard_probe_marker__" in (_r.stderr or ""),
