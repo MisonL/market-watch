@@ -116,6 +116,19 @@ for _t in ("反弹无量宜减仓", "逢反弹分批减仓", "反弹可分批减
     check(A._advice_hit(_t) is not None,
           f"加了否定豁免后，语气词族失效：{_t!r}")
 
+# ---------- ④b 形态正则本身不许因“加否定守卫”而废掉 ----------
+# ⚠️ 第一版写成了 `[ ^，。；！？\n]`（`^` 前多了个空格），字符类里
+# `^` 不在首位就不取反 —— 变成"匹配任意字符（含标点）"。
+# 结果是「开盘后减仓」这类**真指令**也会漏，判据被自己加的守卫拆掉。
+# 必须钉住：过渡段的标点要能阻断匹配。
+for _t in ("回踩后加仓", "反弹时减仓", "明日开盘减一半",
+           "逢低加仓", "高位减仓一半", "开盘后减仓"):
+    check(A._advice_hit(_t) is not None,
+          f"形态正则被否定守卫误伤，真指令漏网：{_t!r}")
+_pat = A._ADVICE_SHAPE_RE.pattern
+check("[ ^" not in _pat and "[^，。；！？" in _pat,
+      f"过渡段字符类写错了（`^` 前多了空格 → 不取反）：{_pat!r}")
+
 # ---------- ⑤ 全量历史推送：`买入` 命中 0 ----------
 _pushes = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "state", "history", "pushes.jsonl")
