@@ -2691,8 +2691,17 @@ def _hot_strong_lines(hot, n=None):
             # KeyError」，f24 是同族字段，只是排在 try 外没被同一道网罩住。
             _p = (f"60日{r['f24']:+.1f}%" if r.get("_f24_ok")
                   else "60日位置未知")
-            _out.append(f"  {r['name']} {r['chg']:+.2f}% {_p} " + 
-                        (f"量比{r['vr']:.1f}" if r.get('_vr_ok', False) else "量比未知") + f" 主力占比{r['pct']:+.1f}% "
+            # ⚠️⚠️ 2026-11-24（P2）：`_vr_ok=True` 但 `vr` 非数值时，
+            # `f"量比{r['vr']:.1f}"` 会在 try 内抛 ValueError → 整行被
+            # 当成「坏行」跳过 —— 5 个热点里丢 1 行，读者少一个方向。
+            # 旧 schema 缓存 / 手工编辑都可能让 `_vr_ok` 与 `vr` 脱节。
+            # 与 f24 同款守卫：`_vr_ok` 只负责"是否打印数值"，数值本身
+            # 必须再过一次 `M.isnum`。非数值 → 渲染「量比未知」而非丢行。
+            if r.get('_vr_ok', False) and M.isnum(r.get('vr')):
+                _vr_txt = f"量比{r['vr']:.1f}"
+            else:
+                _vr_txt = "量比未知"
+            _out.append(f"  {r['name']} {r['chg']:+.2f}% {_p} " + _vr_txt + f" 主力占比{r['pct']:+.1f}% "
                         # ⚠️ 用「龙头」而不是「领涨」（2026-10-30 修，P2）：
                         # `lead` 是接口的 **f128 领涨股**，它是**板块内**最强的
                         # 那一只，而本行的 `chg` 是**板块**涨跌幅 —— 板块下跌
@@ -3442,7 +3451,8 @@ def build_brief(q, sg, hits, now, hot=None, slot=None):
                     _p = (f"60日{r['f24']:+.1f}%" if r.get("_f24_ok")
                           else "60日位置未知")
                     L.append(f"  {r['name']} {r['chg']:+.2f}% {_p} " + 
-                             (f"量比{r['vr']:.1f}" if r.get('_vr_ok', False) else "量比未知") + f" 主力占比{r['pct']:+.1f}%")
+                             (f"量比{r['vr']:.1f}" if (r.get('_vr_ok', False)
+                               and M.isnum(r.get('vr'))) else "量比未知") + f" 主力占比{r['pct']:+.1f}%")
                 except (KeyError, TypeError, ValueError):
                     _hot_bad += 1
         if _hot_bad:
@@ -7863,7 +7873,8 @@ def _fallback_text(q, hits, slot, now, hot=None):
                 _p = (f"60日{r['f24']:+.1f}%" if r.get("_f24_ok")
                       else "60日位置未知")
                 _rows.append(f"  {r['name']} {r['chg']:+.2f}% {_p} " + 
-                             (f"量比{r['vr']:.1f}" if r.get('_vr_ok', False) else "量比未知") + f" 主力占比{r['pct']:+.1f}%")
+                             (f"量比{r['vr']:.1f}" if (r.get('_vr_ok', False)
+                               and M.isnum(r.get('vr'))) else "量比未知") + f" 主力占比{r['pct']:+.1f}%")
             except (KeyError, TypeError, ValueError):
                 continue
         _start_txt = ("**启动板块**（放量+吸筹+位置低）\n" + "\n".join(_rows)

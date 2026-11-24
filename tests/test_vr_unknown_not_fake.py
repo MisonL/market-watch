@@ -230,6 +230,23 @@ check("量比1.7" in _b3,
       f"`_vr_ok=True` 的行没印出「量比1.7」：\n"
       f"      {[x for x in _b3.split(chr(10)) if '文娱用品' in x][:1]!r}")
 
+# ⑤b `_vr_ok=True` 但 `vr` 非数值（旧 schema 缓存 / 手工编辑）——
+# 必须印「量比未知」，**不能整行丢**。与 f24 同款守卫：
+# `_vr_ok` 只负责"是否打印数值"，数值本身再过一次 `M.isnum`。
+for _bad_vr in (None, "-", "abc", ""):
+    _b4 = _brief(_mkrow(_vr_ok=True, vr=_bad_vr))
+    check("量比未知" in _b4,
+          f"`_vr_ok=True` 但 vr={_bad_vr!r} 时没印「量比未知」：\n"
+          f"      {[x for x in _b4.split(chr(10)) if '文娱用品' in x][:1]!r}")
+    check("文娱用品" in _b4,
+          f"`_vr_ok=True` 但 vr={_bad_vr!r} 时**整行被丢**（bad 计数路径），"
+          f"读者少了一个方向")
+# 数值行仍正常（不能一刀切全变「未知」）
+_b5 = _brief(_mkrow(_vr_ok=True, vr=-0.5))
+check("量比-0.5" in _b5,
+      f"`_vr_ok=True, vr=-0.5` 没印出「量比-0.5」："
+      f"{[x for x in _b5.split(chr(10)) if '文娱用品' in x][:1]!r}")
+
 # ---------- ⑥ 构造时就要有默认值 ----------
 check("_vr_ok=M.isnum(x.get(\"f10\"))" in _code_hot
       or "_vr_ok=M.isnum(x.get('f10'))" in _code_hot,
