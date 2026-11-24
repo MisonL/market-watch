@@ -93,10 +93,31 @@ _orig_fail_get, _orig_fail_set = M.ai_fail_get, M.ai_fail_set
 # 看起来像代码坏了。
 M.ai_fail_get = lambda: 0
 M.ai_fail_set = lambda *_a, **_k: None
+# ⚠️⚠️ 还必须桩掉 `claude_bin()`。
+# 它失败时**在到达 `_invoke` 之前**就 `return ""`，看门狗一次都不会被调用。
+# CI 上没有 claude CLI → 本文件在 CI 上必红：
+#     ❌ 看门狗一次都没被调用 —— 接线断了
+# 那是**假红**：接线是好的，只是探针没跑起来。本仓库反复踩的就是这个
+# （`[实测]` 2026-10-02 自检里「缺失标注未进入 prompt」同因）——
+# **「探针没跑」与「功能坏了」必须分开报**，否则归因直接跑偏。
+# 这里返回一个**必然存在的**可执行文件即可（`run_with_idle_watchdog` 已桩，
+# 不会真执行它）。
+_orig_cb = M.claude_bin
+M.claude_bin = lambda: (sys.executable, "")
+_orig_exec = getattr(A, "CLI_BACKOFF_FILE", None)
 try:
     # ---------- ① 取数越界 -> 拿地板 ----------
     _caps = _run_round(133000, [])
-    check(bool(_caps), "看门狗一次都没被调用 —— 接线断了")
+    # ⚠️ 空 `_caps` 有**两种**原因，必须分开报：
+    #   · `claude_bin()` 返回 None（CI 没 CLI）-> 探针根本没跑到 _invoke
+    #   · 真的没把 _budget 传给看门狗 -> 接线断了
+    # 混报会让归因跑偏（本仓库反复的形态）。`claude_bin` 已桩成必然成功，
+    # 所以走到这里为空就真是接线问题 —— 但仍要把这句话写出来，
+    # 免得下次有人删掉桩。
+    check(bool(_caps),
+          "看门狗一次都没被调用。两种可能：① `claude_bin()` 返回了 None"
+          "（CI 无 CLI，探针没跑 —— 本文件已桩，不该发生）；"
+          "② 真的没接上（接线断了）")
     _t = _caps[0]
     check(_t is not None,
           "首次调用时 total_limit 是 None —— 地板算出来了却没传给看门狗"
@@ -141,6 +162,7 @@ try:
 finally:
     M.run_with_idle_watchdog = _orig_wd
     M.ai_fail_get, M.ai_fail_set = _orig_fail_get, _orig_fail_set
+    M.claude_bin = _orig_cb
     A._ROUND_AI_MS.clear()
     A._ROUND_DATA_MS = 0
 
