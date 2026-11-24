@@ -77,11 +77,28 @@ def _run_round(data_ms, ai_ms_list):
         _caps.append(kw.get("total_limit"))
         return (0, "", "", False)        # rc=0 但无正文 -> 走兜底/重写
 
+    # ⚠️⚠️ 三个桩必须**在这个函数里**装拆，不能靠外层。
+    # 第一版只在外层 try 里桩 `claude_bin` / `ai_fail_*`，`finally` 一恢复，
+    # 第 ⑥ 段（不限制模式）就回到「CI 无 CLI → 提前 return」→
+    # `_caps` 为空 → 报「地板把这条路径弄崩了」。
+    # 而那根本不是地板的问题，是**夹具没跟着用例走**。
+    # CI py3.13 精确报出了这条：
+    #     ❌ 不限制模式（AI_ROUND_BUDGET=None）下看门狗没被调用
+    _sv = (M.run_with_idle_watchdog, M.ai_fail_get, M.ai_fail_set,
+           M.claude_bin)
     M.run_with_idle_watchdog = _fake_wd
-    A.ai_analyze("【指数】x", [], "", slot="14:30")
+    M.ai_fail_get = lambda: 0
+    M.ai_fail_set = lambda *_a, **_k: None
+    M.claude_bin = lambda: (sys.executable, "")
+    try:
+        A.ai_analyze("【指数】x", [], "", slot="14:30")
+    finally:
+        (M.run_with_idle_watchdog, M.ai_fail_get, M.ai_fail_set,
+         M.claude_bin) = _sv
     return _caps
 
 
+# `_run_round` 自带全部桩（见其内部注释），这里只留一个还原锚。
 _orig_wd = M.run_with_idle_watchdog
 _orig_fail_get, _orig_fail_set = M.ai_fail_get, M.ai_fail_set
 # ⚠️⚠️ 必须**同时**桩掉 AI 熔断。

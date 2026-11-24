@@ -27,3 +27,6 @@ conf/plan.md
 # 2026-11-24：三个 .log 被 `git add -A` 带进了仓库，于是 CI 下载产物时
 # 看到的是**上一次本机失败**的内容，我据此误判成 CI 刚红的。
 tests/*.log
+
+# CI 产物下载目录（gh run download）—— 上次忘了加，误提交了 py3.13 的失败日志
+test-output-*/
