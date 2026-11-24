@@ -68,6 +68,18 @@ def check(cond, msg):
         sys.exit(1)
 
 
+# ⚠️⚠️ `agent/` 是**独立仓库**，不在主仓库的版本库里（见 .gitignore）。
+# CI 只 checkout 主仓库，那里根本没有这个文件 —— 第一版直接 open() 就
+# FileNotFoundError，把整条 CI 打红（2026-11-24 实测，py3.11 与 py3.13 都红）。
+#
+# 这里显式跳过，并把话说清楚：**本项在 CI 上从未真正验证过**。
+# 真正跑它的是生产机（`tests/run_all.sh` 本地一轮 74/74 含本项）。
+# 不要把它当成"CI 绿了所以看门狗没问题"——那是跳过≠通过。
+if not os.path.exists(_MAIN):
+    print(f"SKIP（agent/ 不在本 checkout 里 —— 独立仓库、CI 只拿主仓库。"
+          f"本项在**生产机**上验证，CI 上未验证）")
+    sys.exit(0)
+
 _src = open(_MAIN, encoding="utf-8").read()
 
 # ---------- ① initialize 超时必须给足 ----------
