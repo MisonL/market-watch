@@ -108,20 +108,47 @@ try:
     M._FC_PACE_FILE = _pace2
     M.FC_WINDOW = 0.6
     M.FC_MAX_PER_WINDOW = 2
-    _real = []
-    for _k in range(6):
-        _t0 = time.monotonic()
-        M._fc_pace()
-        _real.append(time.monotonic() - _t0)      # 本次**实际等待**秒数
+    # ⚠️⚠️ 2026-11-24（CI 红）：**量「请求的睡眠时长」，不量墙钟。**
+    #
+    # 原先量 `time.monotonic()` 前后差，断言「前 2 次 < 0.15s」。
+    # CI 上实测：
+    #     前 2 次调用的等待是 [0.17, 0.01]，未满窗口却在拖慢
+    # 0.17s 不是窗口等待，是**文件锁 + 原子写在慢机器上的耗时**。
+    # 而固定间隔退化时每次要等 `0.6/2 = 0.3s` —— 判据区间
+    # (0.15, 0.3) 只有 0.15s 宽，必然被 I/O 抖动穿透。
+    #
+    # 与本仓库反复修的那类缺陷同型：**量的是墙钟，判的是语义**。
+    # 改成桩掉 `time.sleep`，直接看 `_fc_pace` "打算睡多久" ——
+    # 那是纯语义量，零 I/O 噪声。未来时刻的排票逻辑不受影响
+    # （`_fc_pace` 先写盘、再在锁外 sleep）。
+    _slept = []
+    _orig_sleep = M.time.sleep
+
+    def _fake_sleep(_s):
+        _slept.append(float(_s))
+    M.time.sleep = _fake_sleep
+    _wait = []                       # **每次调用**请求的等待时长（无等待记 0）
+    try:
+        for _k in range(6):
+            _n0 = len(_slept)
+            M._fc_pace()
+            _wait.append(sum(_slept[_n0:]))
+    finally:
+        M.time.sleep = _orig_sleep
+
+    def _wait_at(_i):
+        return _wait[_i] if _i < len(_wait) else 0.0
 
     # ① 前 2 次不得等待（滑动窗口相对固定间隔的核心优势）
-    check(_real[0] < 0.15 and _real[1] < 0.15,
-          f"前 2 次调用的等待是 {[round(x, 2) for x in _real[:2]]}，"
-          f"未满窗口却在拖慢 —— 滑动窗口退化成了固定间隔")
+    check(_wait_at(0) < 0.05 and _wait_at(1) < 0.05,
+          f"前 2 次请求的等待是 "
+          f"{[round(_wait_at(0), 2), round(_wait_at(1), 2)]}s，"
+          f"未满窗口却在拖慢 —— 滑动窗口退化成了固定间隔"
+          f"（固定间隔每次要等 {M.FC_WINDOW / M.FC_MAX_PER_WINDOW:.1f}s）")
     # ② 第 3 次必须等（窗口已满）
-    check(_real[2] >= 0.3,
-          f"窗口已满（2/0.6s）但第 3 次只等了 {_real[2]:.2f}s —— 没拦住，"
-          f"真实上限 11/min 会被打穿")
+    check(_wait_at(2) >= 0.3,
+          f"窗口已满（2/0.6s）但第 3 次只请求等 {_wait_at(2):.2f}s —— "
+          f"没拦住，真实上限 11/min 会被打穿")
     # ③ 任意 0.6s 窗口内不超过 2 次（用真实时刻验，不是模拟）
     _ts = M._load_json(_pace2, {}).get("ts") or []
     check(len(_ts) <= 2,
