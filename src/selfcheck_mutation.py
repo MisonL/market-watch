@@ -4903,8 +4903,10 @@ MUTANTS = [
 
     ("data-budget-cap-silent",
      "marketlib.py",
-     '    if own_s is not None and _cap < own_s:',
-     '    if False and own_s is not None and _cap < own_s:',
+     # ⚠️ 2026-11-24：源码加了 1s 容差（`_cap < own_s - 1.0`，
+     # 防亚秒差刷「被压到 120s」的假告警），锚点同步。
+     '    if own_s is not None and _cap < own_s - 1.0:',
+     '    if False and own_s is not None and _cap < own_s - 1.0:',
      "[取数全局上限] 钳制不留痕 → 该源本轮取不全（量比全按 1.0、热点榜变"
      "子集）而推送里看不出来，事后只能靠「这轮怪怪的」去猜",
      "钳制日志应恰好 1 条"),

@@ -92,7 +92,7 @@ def fetch_sectors():
         # 一轮 19 次请求而 firecrawl 额度只有 11/min、DATA_BUDGET 120s，
         # 19 次需要 127s —— 算术上就不可能取全。
         # 见 `marketlib.sector_rows` 上方的账。
-        got, _tot, _complete = M.sector_rows(fs, budget_s=60, max_pn=8)
+        got, _tot, _complete = M.sector_rows(fs, max_pn=8)
         for x in got:
             # ⚠️ 必须判 dict。clist() 会把 diff 里的元素**原样透传**，而
             # diff 的形状由上游决定（可能是 list 含字符串/None），

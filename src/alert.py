@@ -674,7 +674,7 @@ def _sector_rows(fs):
     #
     # 判据不变：`complete=False` 时照旧返回已取部分，并明确标注
     # "本轮结论不是没有异动、而是没看全"。
-    rows, _total, _complete = M.sector_rows(fs, budget_s=45, max_pn=8)
+    rows, _total, _complete = M.sector_rows(fs, max_pn=8)
     if not _complete:
         _log(f"板块资金扫描({fs}) 未能确认取全"
              f"（已取 {len(rows)}/{_total if _total else '?'}）—— "

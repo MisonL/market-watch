@@ -5234,7 +5234,14 @@ def data_cap(own_s, what=""):
         _cap = _left
     else:
         _cap = min(own_s, _left)
-    if own_s is not None and _cap < own_s:
+    # ⚠️ 2026-11-24：**亚秒差不该报「全局上限生效」**。
+    # `sector_rows` 先取 `data_left()` 当 own_s，`clist` 再调 `data_cap()`
+    # 又取一次 `data_left()` —— 中间隔了几十毫秒，于是 `_cap` 永远比
+    # `own_s` 小一点点，日志变成：
+    #     「自身预算 120s 被压到 120s（本轮已用 0s）」
+    # 一条**自相矛盾**的告警，且每轮都会出现 —— 典型的告警疲劳。
+    # 给 1s 容差：只有真的被压掉 ≥1s 才算"压"。
+    if own_s is not None and _cap < own_s - 1.0:
         _k = what or "未命名"
         if _k not in _DATA_CAPPED:
             _DATA_CAPPED.add(_k)
@@ -5502,7 +5509,7 @@ def sector_round_reset():
     _SECTOR_CACHE.clear()
 
 
-def sector_rows(fs, budget_s=45, max_pn=8):
+def sector_rows(fs, budget_s=None, max_pn=8):
     """取一类板块的**全量**名单（同轮内只拉一次，hot 与 alert 共用）。
 
     返回 `(rows, total, complete)`：
@@ -5512,10 +5519,34 @@ def sector_rows(fs, budget_s=45, max_pn=8):
 
     ⚠️ 只缓存**成功**的结果（`rows` 非空）。失败也缓存的话，本轮后续
     调用会拿到空名单并当成"真没有板块" —— 那是静默漏报。
+
+    ⚠️⚠️ 2026-11-24 第二次修：`budget_s` 默认从**固定 45s** 改成 `None`
+    （= 用 `data_cap` 的**全局剩余**）。
+    `[实测]` 单页 firecrawl 要 **5~8 秒**，而配额窗口保证两次调用至少隔
+    6.7s —— 6 页的概念板块**光排队就要 40 秒**。而原实现每类各给 45s，
+    且两个 fs 共享同一个全局窗口，于是第二个 fs 常常"预算在排队中耗尽"：
+        14:45:08  t:2 取到 494/496（用满 45s）
+        14:45:55  t:3 只取到 **100/554**（45s 全花在等配额上，只成了 1 页）
+    两个 fs 合计 11 页 ≈ 73s，**全局预算 120s 是够的** ——
+    缺的不是总预算，是**分配**：每个 fs 各拿固定 45s，先跑的吃满了、
+    后跑的连排队都不够。
+    改成用全局剩余后，两个 fs 自然按实际需要分配，总和不超 120s。
     """
     _hit = _SECTOR_CACHE.get(fs)
     if _hit is not None:
         return _hit
+    # ⚠️ 预算：**用全局剩余**，而不是各 fs 一个固定值。
+    # 没设 deadline 时（standalone 调用 alert）退回 60s ——
+    # 不能退成 `None`（= 无限制），那会让一个慢 fs 无上界地跑。
+    if budget_s is None:
+        # ⚠️ 不能用 `data_left() or 60.0` —— 剩余**真的是 0** 时
+        # `or` 会把它变成 60s，等于凭空多给一分钟（预算闸门被绕过）。
+        # 只有"没有全局 deadline"（返回 None）才退回 60s。
+        try:
+            _left = data_left()
+        except Exception:
+            _left = None
+        budget_s = 60.0 if _left is None else max(1.0, float(_left))
     rows, total = clist(fs, SECTOR_FIELDS, pz=500, max_pn=max_pn,
                         fid="f62", po=1, budget_s=budget_s, with_total=True)
     rows = [r for r in (rows or []) if isinstance(r, dict)]
