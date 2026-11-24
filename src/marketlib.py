@@ -2717,6 +2717,12 @@ def _fc_pace():
 #       其余失败（无输出/真非 JSON/调用异常）→ 仍 900s。
 FIRECRAWL_GATEWAY_COOLDOWN = 120
 
+# 网关抖动**就地重试**前的等待（秒）。8s 的取舍：
+# 抖动通常几秒自愈（今早同一 URL 连打 23 次全成功），8s 足够跨过去；
+# 又不至于让一次扫描被单个坏页拖垮（19 页 × 最多一次重试 = 最坏 +8s，
+# 远超预算才需要担心）。
+FIRECRAWL_GW_RETRY_DELAY = 8
+
 # 网关 5xx 页的识别式。**只认这几种**：
 #   · HTTP 状态行/标题形的 502 / 503 / 504
 #   · nginx/openresty 的默认错误页标题
@@ -2755,7 +2761,7 @@ _PROXY_FAIL_FILE = p_cache("proxy_fail.json")
 PROXY_FAIL_THRESHOLD = 3
 
 
-def firecrawl_get(url, timeout=None):
+def firecrawl_get(url, timeout=None, _gw_retry=True):
     """经 firecrawl 云端抓取 URL，返回**原始文本**；不可用/失败返回 None。
 
     通用能力：任何 HTTP 抓取都能用，不限于 JSON 接口。
@@ -2858,9 +2864,28 @@ def firecrawl_get(url, timeout=None):
     # `<html>…<body>…</body></html>` 的完整包裹；502 页的骨架可能不完整，
     # 剥不掉时 `<title>` 还在正文里 —— 用剥后的 `out` 匹配会漏。
     if _FIRECRAWL_GW_RE.search(_raw):
-        log(f"firecrawl **网关 5xx**（瞬时抖动，不是东财故障、也不是额度）："
-            f"冷却 {FIRECRAWL_GATEWAY_COOLDOWN}s 后重试，本轮该接口数据缺失",
-            "FEED")
+        # ⚠️⚠️ 2026-11-24（P1，实测）：网关抖动要**就地重试**，不能立刻武装冷却。
+        #
+        # `[实测]` 13:35:04：扫描进行到 `clist(m:90+t:2)` 第 2 页时撞上一次
+        # 网关 5xx -> 武装 120s 冷却 -> 而本轮剩下的 17 页全部在 0.0s 内
+        # 空回（日志里连着 10 条「firecrawl 正在冷却，重试无意义」）。
+        # 结果：13:35 那条推送里**板块整段缺失**、`hot` 候选池为空。
+        #
+        # 一次几秒的抖动毁掉整轮 19 页 —— 冷却时长改到 120s 并没有解决这个，
+        # 因为 120s 仍然比"剩余扫描时间"长。真正的修法是：**别让它停机**。
+        # 网关抖动通常几秒内自愈（今早实测同一 URL 连打 23 次全成功），
+        # 所以先睡几秒重试一次，成功就继续；仍失败才认账、武装冷却。
+        #
+        # 代价上限：每次扫最多被拖 `FIRECRAWL_GW_RETRY_DELAY` 秒（默认 8s），
+        # 仍在 DATA_BUDGET=120s 之内；而收益是整轮数据不丢。
+        if _gw_retry:
+            log(f"firecrawl **网关 5xx**（瞬时抖动，不是东财故障、也不是额度）"
+                f"—— 就地重试 1 次（等 {FIRECRAWL_GW_RETRY_DELAY}s），"
+                f"**不武装冷却**：冷却会让本轮剩余分页全部作废", "FEED")
+            time.sleep(FIRECRAWL_GW_RETRY_DELAY)
+            return firecrawl_get(url, timeout=timeout, _gw_retry=False)
+        log(f"firecrawl **网关 5xx** 重试后仍失败 —— 武装 "
+            f"{FIRECRAWL_GATEWAY_COOLDOWN}s 冷却（真故障了，不是抖动）", "FEED")
         _fc_fail_set(time.time() + FIRECRAWL_GATEWAY_COOLDOWN)
         return None
     # ⚠️ 成功一次 -> 连续失败计数清零（见 `_fc_ok`）。

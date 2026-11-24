@@ -97,6 +97,19 @@ check(_gw >= 30,
 check(_gw <= 300,
       f"网关冷却 {_gw}s 仍偏长：一次抖动会漏掉 2~3 个调度周期")
 
+# ---------- ③c 重试间隔必须有上界 ----------
+# ⚠️ 行为段把间隔临时设成 0 秒（否则要真睡），所以**间隔本身的合理性
+# 必须另有静态断言** —— 否则把它改成 60s，行为段照样全绿。
+_d = getattr(M, "FIRECRAWL_GW_RETRY_DELAY", None)
+check(_d is not None,
+      "缺少 FIRECRAWL_GW_RETRY_DELAY —— 网关重试没定义等待时长")
+check(0 < _d <= 15,
+      f"网关重试间隔 {_d}s 不合理：抖动通常几秒自愈，间隔过长等于让"
+      f"一次扫描被单个坏页拖垮（19 页各拖 {_d}s 会撑爆 DATA_BUDGET=120s）")
+check(_d < M.FIRECRAWL_GATEWAY_COOLDOWN,
+      f"重试间隔 {_d}s 不小于冷却 {M.FIRECRAWL_GATEWAY_COOLDOWN}s —— "
+      f"那不如直接放弃，重试没有意义")
+
 # ---------- ④ 接线 ----------
 _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "..", "src", "marketlib.py"), encoding="utf-8").read()
@@ -144,13 +157,28 @@ try:
         stdout = _REAL_502
         stderr = ""
 
+    # ⚠️ 2026-11-24：网关 5xx 现在**就地重试一次**（不立刻武装冷却）。
+    # 所以桩必须"每次都返 502"才能走到武装冷却那一步。
     _real_run = M.subprocess.run
-    M.subprocess.run = lambda *a, **k: _R()
+    _calls = []
+
+    def _run(*a, **k):
+        _calls.append(1)
+        return _R()
+    M.subprocess.run = _run
+    _dl0 = M.FIRECRAWL_GW_RETRY_DELAY
+    M.FIRECRAWL_GW_RETRY_DELAY = 0.0      # 别真睡 8 秒
     try:
         _got = M.firecrawl_get("https://example.invalid/probe")
     finally:
         M.subprocess.run = _real_run
+        M.FIRECRAWL_GW_RETRY_DELAY = _dl0
     check(_got is None, "网关 5xx 应返回 None（不能把错误页当数据交出去）")
+    # ---------- ⑥ 就地重试：先试 2 次再认账 ----------
+    check(len(_calls) == 2,
+          f"网关 5xx 只发起了 {len(_calls)} 次请求，应重试 1 次（共 2 次）—— "
+          f"一次几秒的抖动会直接让本轮剩余分页全部作废"
+          f"（实测 13:35:04 就是这样丢掉整轮板块数据的）")
     import time as _t
     _until = M._fc_fail_get()
     check(_until > 0,

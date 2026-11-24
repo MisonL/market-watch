@@ -59,7 +59,7 @@ def check(cond, msg):
 _TD = tempfile.mkdtemp(prefix="mw_fcrate_")
 _orig = (M._fc_fail_get, M._fc_fail_set, M.log,
          M._FIRECRAWL_NODE, M._FIRECRAWL_CLI, subprocess.run,
-         M._FC_FAIL_FILE)
+         M._FC_FAIL_FILE, M._fc_pace)
 _logs = []
 
 
@@ -83,6 +83,14 @@ try:
     # 用 `sys.executable` 最可移植（Python 自己就是可执行文件）。
     M._FIRECRAWL_NODE = sys.executable
     M._FIRECRAWL_CLI = sys.executable
+    # ⚠️⚠️ 2026-11-24（实测踩到）：**必须桩掉配额窗口**。
+    # 本文件的断言都在量「冷却时长 = until - _t0」，而 `_t0` 取在
+    # `firecrawl_get` **调用之前**。配额窗口会在这两者之间插入一段
+    # 最长 ~9s 的等待，于是冷却被量成 60 + 9 = 69s，断言红：
+    #     ❌ 限流却套了 71s 冷却（应 ≈60s）
+    # 这不是分档坏了，是**测试在量墙钟**。分档语义由
+    # `test_firecrawl_pacing.py` 单独验，这里不该被它干扰。
+    M._fc_pace = lambda: None
     # 冷却用内存桩，避免写生产 firecrawl_fail.json
     _state = {"until": 0.0}
     M._fc_fail_get = lambda: _state["until"]
@@ -180,7 +188,7 @@ try:
 finally:
     (M._fc_fail_get, M._fc_fail_set, M.log,
      M._FIRECRAWL_NODE, M._FIRECRAWL_CLI, subprocess.run,
-     M._FC_FAIL_FILE) = _orig
+     M._FC_FAIL_FILE, M._fc_pace) = _orig
     import shutil
     shutil.rmtree(_TD, ignore_errors=True)
 
