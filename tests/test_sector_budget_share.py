@@ -67,7 +67,12 @@ _SRCPY = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # ---------- ① 预算来自全局剩余，不是固定常数 ----------
 _i = _SRCPY.find("def sector_rows(")
-_j = _SRCPY.find("def clist_extremes(", _i)
+# ⚠️ 边界原来是 `def clist_extremes(` —— 那个函数已被删除（它在改用全量
+# 共享名单后成了死代码），于是 `_j = -1`，整段断言变成「找不到定义」。
+# 改成按**下一个顶层 def** 切：不依赖具体是哪个函数，删/加都不影响。
+import re as _re
+_m = _re.search(r"\ndef [a-zA-Z_(]", _SRCPY[_i + 10:])
+_j = (_i + 10 + _m.start() + 1) if _m else len(_SRCPY)
 check(_i > 0 and _j > _i, "找不到 sector_rows 的定义")
 _body = _SRCPY[_i:_j]
 check("data_left()" in _body,

@@ -11,7 +11,7 @@ firecrawl 有每分钟请求上限。超限时 CLI 的形态是：
             Remaining (req/min): 0. Upgrade yo..."
 
 而 `firecrawl_get` 原先只看 `stdout 为空`，一律当失败 -> 套
-`FIRECRAWL_COOLDOWN = 900`（15 分钟）。
+`FC_ESCALATE_MAX = 900`（连续失败时的封顶）。
 
 ## 为什么这会造成**静默截断**（不是"慢一点"）
 
@@ -134,7 +134,7 @@ try:
           f"（应 ≈{M.FIRECRAWL_RATE_LIMIT_COOLDOWN}s）")
     check(_cool >= M.FIRECRAWL_RATE_LIMIT_COOLDOWN - 2,
           f"限流冷却过短：{_cool:.0f}s（应 ≈{M.FIRECRAWL_RATE_LIMIT_COOLDOWN}s）")
-    check(M.FIRECRAWL_RATE_LIMIT_COOLDOWN < M.FIRECRAWL_COOLDOWN,
+    check(M.FIRECRAWL_RATE_LIMIT_COOLDOWN < M.FC_ESCALATE_MAX,
           "限流冷却必须严格短于故障冷却，否则分档没有意义")
     check(any("限流" in s for s in _logs),
           "限流没有留痕：" + repr(_logs))

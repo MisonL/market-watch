@@ -4603,7 +4603,7 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
     #
     # 熔断只影响「**要不要现在就去试**」，不影响内容口径：熔断期内不会
     # 跳过任何推送，仍走兜底模板（模板本来就是 AI 失败时的既定降级）。
-    # 与 PROXY_COOLDOWN(600s)/FIRECRAWL_COOLDOWN(900s) 同族，都是
+    # 与 PROXY_COOLDOWN(600s)/FC_ESCALATE_MAX(900s) 同族，都是
     # 「持续性故障别每轮重付」的落盘冷却（见 marketlib 里的同款注释）。
     #
     # ⚠️ 触发条件是「**主链这一轮零产出**」（2026-10-22 备用链取消后，

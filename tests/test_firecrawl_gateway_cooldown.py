@@ -95,7 +95,7 @@ for _txt, _name in (
 check(hasattr(M, "FIRECRAWL_GATEWAY_COOLDOWN"),
       "缺少 FIRECRAWL_GATEWAY_COOLDOWN —— 网关抖动又回到 900s 冷却")
 _gw = M.FIRECRAWL_GATEWAY_COOLDOWN
-_gen = M.FIRECRAWL_COOLDOWN
+_gen = M.FC_ESCALATE_MAX
 check(_gw < _gen / 3,
       f"网关冷却 {_gw}s 没有显著短于通用 {_gen}s —— 分档等于没做"
       f"（今日 7 次 502 会吃掉 105 分钟，上午只有 240 分钟）")

@@ -2452,7 +2452,7 @@ def _proxy_fail_reset(host=""):
 # `[实测]` 2026-10-21：网关 `stream disconnected before completion`
 # 全天不断，7 轮 AI 产出 0/7，光等 AI 烧掉约 2000s。
 #
-# 与 PROXY_COOLDOWN / FIRECRAWL_COOLDOWN 同族：**落盘**冷却（跨进程 ——
+# 与 PROXY_COOLDOWN / FC_ESCALATE_MAX 同族：**落盘**冷却（跨进程 ——
 # analyze 每轮新起进程，进程内状态每轮重置等于没冷却）。
 # 冷却期 600s = 2 个调度周期：短于它一轮慢轮就耗光；长于它通道恢复后
 # 要多发几分钟模板。到期后第一轮**照常尝试**，不做"再确认一次"。
@@ -2562,7 +2562,15 @@ def _proxy_fallback_log_once(host):
     _daily_log_once(
         host, "proxyfallback",
         f"直连失败，经代理兜底成功: {host}（本日首次，同主机后续不再重复）")
-FIRECRAWL_COOLDOWN = 900        # 冷却 15 分钟；期间不再尝试
+# ⚠️ 2026-11-24：删除 `FIRECRAWL_COOLDOWN = 900`。
+#
+# 它曾是"firecrawl 失败一律冷却 15 分钟"的唯一出口，而现在三种失败各有
+# 自己的档位（限流 60s / 网关 120s / 其余递增 120→900s），900 这个数
+# 已经由 `FC_ESCALATE_MAX` 表达。两个常量同写 900 = **同一真值抄两份**，
+# 而本仓库反复修的就是这类漂移（改一个忘另一个，两边行为不一致）。
+# 自检的「顶层常量无任何引用」项抓到了它。
+#
+# 保留 `FC_ESCALATE_MAX` 作为唯一真值。
 
 # ⚠️⚠️ 2026-11-23（P1 静默截断的真正根因）：**限流不是故障，不该按故障冷却**。
 #
@@ -2590,7 +2598,7 @@ FIRECRAWL_RATE_LIMIT_COOLDOWN = 60
 # 而一轮完整扫描要几次请求？
 #     行业 m:90+t:2  496 个 / pz=100 硬上限 = 5 页
 #     概念 m:90+t:3  554 个 / 100           = 6 页
-#     clist_extremes 两方向各 ≤2 页          = ≤8 页
+#     （当时 alert 还另打两端，两方向各 ≤2 页 = ≤8 页）
 # 合计 **11~19 次**。这些请求是**背靠背**发出的 —— `firecrawl_get` 里
 # 一次 `time.sleep` 都没有（grep 确认 0 处）。于是：
 #   请求 1..11 在几秒内打完 -> 第 12 次撞上限 -> 套 60s 限流冷却
@@ -5555,74 +5563,6 @@ def sector_rows(fs, budget_s=None, max_pn=8):
     if rows:
         _SECTOR_CACHE[fs] = rec
     return rec
-
-
-def clist_extremes(fs, fields, fabs, pz=100, pages=2, budget_s=None):
-    """只取**资金两端**（流入榜头 + 流出榜头），供异动判定用。
-
-    为什么需要这个函数（`[实测]` 2026-11-23 盘中）：
-    服务端把 `pz` 硬截到 **100 行**（`pz>=200` 直接返回 0 行），
-    所以全量 496 个行业 / 554 个概念各要 5~6 页 —— 一次全量扫描
-    就是 **11 次请求**。而经 firecrawl 兜底时额度只有 **12 次/分钟**，
-    一次全量就把整分钟额度吃光。当天实测：每一轮都在第 4~6 页限流，
-    行业缺 96 个、概念缺 54~354 个，`alert` 两个 `_sector_rows`
-    全部返回 0 条 -> 推送里 12 个关注板块整段「数据暂缺」。
-
-    但异动判定的门槛是 `|f62| >= fabs`（默认 50 亿），**只需要尾部**：
-    `po=1` 按 f62 降序拿流入最大的，`po=0` 升序拿流出最大的。
-    末尾（最小 |f62|）一旦低于门槛，后面的行必然更小，可以安全停。
-
-    ⚠️ 每个方向**只调一次** `clist`，靠它内部的 `max_pn` 翻页。
-    踩过：写成 `for _cap in (pages, pages*2)` 渐进加码，第二次调用会把
-    第一页**重新取一遍** —— 实测 10 次请求，比全量的 11 次几乎没省。
-
-    返回 `(rows, complete)`：
-      · `rows`     —— 两方向已取到的行，按 `f12` 去重（保留先到的）
-      · `complete` —— 是否**确认**取全了所有超门槛的板块。
-        任一方向取不到、或末尾仍超门槛、或预算耗尽 -> `complete=False`，
-        调用方必须据此降级（标记本轮不完整），**不得**当真取全了。
-    """
-    out = []
-    seen = set()
-    complete = True
-    _t0 = time.monotonic()
-    for _po, _label in ((1, "流入"), (0, "流出")):
-        if budget_s is not None and time.monotonic() - _t0 > budget_s:
-            log(f"clist_extremes({fs}) 预算耗尽于{_label}方向之前，"
-                f"该方向未取", "FEED")
-            complete = False
-            break
-        _got = clist(fs, fields, pz=pz, max_pn=pages, fid="f62",
-                     po=_po, budget_s=budget_s)
-        _got = [r for r in (_got if isinstance(_got, list)
-                            else list((_got or {}).values()))
-                if isinstance(r, dict)]
-        _vals = [r.get("f62") for r in _got if isnum(r.get("f62"))]
-        # ⚠️⚠️ 空结果**不能**当作"这个方向没有超门槛板块"。
-        # `[实测]` 2026-11-23：firecrawl 限流时该方向整段返回 0 条，
-        # 而 `not _vals` 会让流程继续并**保持 complete=True** ——
-        # "一条都没取到"被报成"确认取全了"，下游照常当作完整名单使用，
-        # 12 个关注板块整段缺失却没人知道。
-        # 这正是本仓库反复修的「判据写在注释里、没写在代码里」。
-        if not _vals:
-            log(f"clist_extremes({fs}) {_label}方向**一条都没取到** —— "
-                f"无法确认该方向有无超门槛板块", "FEED")
-            complete = False
-        elif min(abs(v) for v in _vals) >= fabs:
-            # 末尾仍超门槛：可能还有超门槛板块没进这一页范围
-            log(f"clist_extremes({fs}) {_label}方向取到 {len(_got)} 行后"
-                f"末尾仍超门槛（{min(abs(v) for v in _vals)/1e8:.1f}亿"
-                f" >= {fabs/1e8:.0f}亿）—— 可能还有未取到的超门槛板块",
-                "FEED")
-            complete = False
-        for r in _got:
-            k = r.get("f12")
-            if isinstance(k, str) and k:
-                if k in seen:
-                    continue
-                seen.add(k)
-            out.append(r)
-    return out, complete
 
 
 def clist_available():
