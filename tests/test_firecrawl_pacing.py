@@ -48,6 +48,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 import marketlib as M
 
+# ⚠️⚠️ 配额窗口现在是**全局**文件（`~/.market-watch-firecrawl-pace.json`），
+# 因为 firecrawl 额度是**账号级**的：沙箱/自检若各有自己的窗口，
+# 它们会凭空吃掉生产的额度而互不可见（实测导致 13:28 生产仍限流，
+# 而那几分钟正是我在沙箱里跑 clist）。
+# 但正因它是全局的，**测试不能写它** —— 否则跑一次测试就让生产少 9 次额度。
+# 用环境变量把它指向临时文件（`_FC_PACE_FILE` 支持该覆盖）。
+import tempfile as _tf
+
+_TD_PACE = _tf.mkdtemp(prefix="mw_fcpace_")
+os.environ["MW_FC_PACE_FILE"] = os.path.join(_TD_PACE, "pace.json")
+M._FC_PACE_FILE = os.environ["MW_FC_PACE_FILE"]
+
 _ok = 0
 
 
@@ -164,5 +176,48 @@ _ts = _ts.get("ts")
 check(isinstance(_ts, list) and len(_ts) == 2,
       f"两个独立进程各调一次后，窗口里应记着 2 次，实得 {_ts!r} —— "
       f"跨进程共享没生效（各记各的，合并后频率翻倍）")
+
+# ---------- ⑤ 窗口文件必须是**全局**的，不能跟着 MW_DIR 走 ----------
+# 这条是本文件最重要的断言。firecrawl 额度是**账号级**的：
+# 沙箱/自检若各有自己的窗口，它们会凭空吃掉生产的额度而互不可见。
+# `[实测]` 13:28 生产仍限流，而那几分钟正是我在沙箱里跑 clist 验证的时候
+# —— 我一边修配额，一边用自己的调试把配额打爆了，而生产日志里只有
+# 「限流」，看不出是谁用的。
+_ml = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "src", "marketlib.py"), encoding="utf-8").read()
+_i = _ml.find("_FC_PACE_FILE = ")
+check(_i > 0, "marketlib 里找不到 `_FC_PACE_FILE` 的定义 —— 判据失效")
+_win = _ml[_i:_i + 400]
+check("p_state(" not in _win,
+      "`_FC_PACE_FILE` 又用 `p_state()` 了 —— 它随 MW_DIR 解析，"
+      "沙箱会拿到自己的窗口，而 firecrawl 额度是账号级的")
+check("expanduser" in _win or "MW_FC_PACE_FILE" in _win,
+      "窗口文件路径既不在用户主目录下、也不支持环境变量覆盖 —— "
+      "要么会被 MW_DIR 拆散，要么测试无法隔离（两者都会污染生产）")
+
+# 真的用两个不同 MW_DIR 起进程，确认拿到的是**同一个**路径
+_CODE = r'''
+import sys
+sys.path.insert(0, {src!r})
+import marketlib as M
+print(M._FC_PACE_FILE, flush=True)
+'''
+_seen = []
+for _d in (None, _tf.mkdtemp(prefix="mw_alt_")):
+    _env = dict(os.environ)
+    _env.pop("MW_FC_PACE_FILE", None)     # 让它走默认解析
+    if _d:
+        _env["MW_DIR"] = _d
+    _r = subprocess.run([sys.executable, "-B", "-c",
+                         _CODE.format(src=os.path.join(
+                             os.path.dirname(os.path.abspath(__file__)),
+                             "..", "src"))],
+                        capture_output=True, text=True, timeout=120, env=_env)
+    check(_r.returncode == 0, f"子进程失败：{(_r.stderr or '')[:120]}")
+    _seen.append(_r.stdout.strip())
+check(_seen[0] == _seen[1],
+      f"两个不同 MW_DIR 的进程拿到**不同**的配额窗口：\n"
+      f"  生产: {_seen[0]}\n  沙箱: {_seen[1]}\n"
+      f"—— 沙箱会凭空吃掉生产的额度且互不可见")
 
 print(f"ALL PASS (firecrawl 跨进程节流 {_ok} 个断言)")

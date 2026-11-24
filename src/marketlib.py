@@ -2613,7 +2613,27 @@ FIRECRAWL_RATE_LIMIT_COOLDOWN = 60
 #   ③ 两个进程的时钟/调度抖动
 FC_WINDOW = 60.0          # 窗口时长（秒）
 FC_MAX_PER_WINDOW = 9     # 窗口内最多发几次（上限 11，留 18% 余量）
-_FC_PACE_FILE = p_state("firecrawl_pace.json")
+
+# ⚠️⚠️ 2026-11-24（P1，实测）：配额是**账号级**的，窗口文件不能跟着 MW_DIR 走。
+#
+# 原先写的是 `p_state("firecrawl_pace.json")` —— 它随 `MW_DIR` 解析，
+# 于是**每个沙箱/自检/测试目录各有自己的一份窗口**：
+#     production: ~/.market-watch/state/firecrawl_pace.json
+#     sandbox   : $TMPDIR/tmp.xxx/state/firecrawl_pace.json
+# 两个窗口互相看不见，但 firecrawl 是按**账号**计费的 ——
+# 沙箱每跑一次全量扫描（19 次请求），生产那边就凭空少了 19 次额度，
+# 而生产的窗口里一次都没记。
+#
+# `[实测]` 13:28:56 生产仍在限流，而那几分钟正是我在沙箱里跑
+# `clist` 验证的时候（13:24 一轮 pn=1..5、13:30 一轮 5 页）。
+# 也就是说：**我一边修配额，一边用自己的调试把配额打爆了**，
+# 而且看不出因果关系 —— 生产日志里只有"限流"，没有"谁用的"。
+#
+# 修法：窗口文件放到一个**与 MW_DIR 无关**的全局路径。
+# 环境变量 `MW_FC_PACE_FILE` 留给测试（否则测试又会污染生产窗口 ——
+# 这已经踩过一次：`test_firecrawl_rate_limit` 曾把递增计数写进生产文件）。
+_FC_PACE_FILE = os.environ.get("MW_FC_PACE_FILE") or os.path.join(
+    os.path.expanduser("~"), ".market-watch-firecrawl-pace.json")
 _fc_pace_local = [[]]     # 锁不可用时的进程内降级：[(时刻)]
 
 
