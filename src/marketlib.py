@@ -2499,6 +2499,47 @@ FIRECRAWL_COOLDOWN = 900        # 冷却 15 分钟；期间不再尝试
 # 分档后：限流 -> 60s 后重试；其余失败 -> 仍是 900s。
 FIRECRAWL_RATE_LIMIT_COOLDOWN = 60
 
+# ⚠️⚠️ 2026-11-24（P1，实测）：**网关 5xx 也不是源故障，不该按 900s 冷却**。
+#
+# 与上面"限流不是故障"是同一类错误的第二个入口。`[实测]` 今日 09:35 起，
+# firecrawl 返回的是它**自己的** 502 页（注意 `charset=windows-1252`、
+# 内容 `<title>502 Bad Gateway</title>` —— 不是东财的错误页）：
+#
+#     [11-24 11:27:13][FEED] firecrawl 返回非 JSON:
+#       '<html>…<title>502 Bad Gateway</title>…'
+#
+# 这是 firecrawl 网关**瞬时抖动**，不是"东财挂了"、也不是"额度用完了"。
+# 但代码走的是通用失败分支 → 武装 900s 冷却 → 此后每次 clist 调用都
+# 在 0.0s 内空回（"firecrawl 正在冷却，重试无意义"）。
+#
+# 代价量化（今日实测）：
+#   · 全天 7 次 502，每次 900s → 累计约 105 分钟冷却
+#   · 上午交易时段只有约 240 分钟 → **近一半时间没有任何板块数据**
+#   · 因冷却被直接放弃的 clist 页：**84 次**
+#   · 而我当时用同一 URL 连打 23 次（含 11 次无间隔突发），**全部成功**
+#     —— 502 确实只是几秒级的抖动，900s 是严重过度惩罚。
+#
+# 分档：网关 5xx → 120s（给它喘一口气，但不毁掉整个上午）；
+#       其余失败（无输出/真非 JSON/调用异常）→ 仍 900s。
+FIRECRAWL_GATEWAY_COOLDOWN = 120
+
+# 网关 5xx 页的识别式。**只认这几种**：
+#   · HTTP 状态行/标题形的 502 / 503 / 504
+#   · nginx/openresty 的默认错误页标题
+# ⚠️ 刻意**不认**裸的 "error" 字样 —— 站点自己返回的业务错误页（"no data"、
+# "参数错误"）是真故障，套短冷却会让每轮都白打请求。宁可漏认（多罚 900s），
+# 也不要错认（把真故障当抖动，每一轮都重打）。
+# ⚠️ 词元类必须带上连字符：504 的默认标题是 `504 Gateway Time-out`，
+# 只写 `[A-Za-z ]` 会**漏掉 504**（实测踩到，反例跑红才发现）。
+# 这是"判据看着对、实际漏一类"的典型 —— 所以正则必须配**正反例**测试，
+# 不能只凭读代码认为它认得。
+_FIRECRAWL_GW_RE = re.compile(
+    r"<title>\s*(?:502|503|504)\s+[A-Za-z][A-Za-z \-]*</title>"
+    r"|HTTP/1\.[01]\s+(?:502|503|504)\b"
+    r"|<h1[^>]*>\s*(?:502|503|504)\b|<(?:center|body)[^>]*>\s*(?:502|503|504)\b"
+    r"|<h1[^>]*>\s*Bad Gateway", re.I)
+
+
 # 代理兜底的失败冷却（2026-10-14 九维度审查 P1）：firecrawl 有冷却而代理
 # 没有 —— 不对称。代理的故障形态分两种：拒连（curl rc=5，0.0s 立即失败，
 # 无害）；**黑洞**（代理活着但丢包，curl 挂满 max-time=20s）—— 后者一轮
@@ -2572,6 +2613,7 @@ def firecrawl_get(url, timeout=None):
         _fc_fail_set(time.time() + FIRECRAWL_COOLDOWN)
         return None
     out = (r.stdout or "").strip()
+    _raw = out          # 未剥壳原文，供网关 5xx 识别（见下方 _FIRECRAWL_GW_RE）
     if not out:
         # ⚠️2026-11-23：**限流**要单独识别。它既不是网络故障、也不是
         # 站点问题，而是"这一分钟额度用完了"，60 秒后就恢复。
@@ -2606,6 +2648,17 @@ def firecrawl_get(url, timeout=None):
                   out, re.S | re.I)
     if _m:
         out = _m.group(1).strip()
+    # ⚠️⚠️ 2026-11-24（P1）：网关 5xx 必须与"源故障"分开处置。
+    #
+    # 判据放在**剥完外壳之前**用整段原文匹配（`_raw`），因为剥壳只认
+    # `<html>…<body>…</body></html>` 的完整包裹；502 页的骨架可能不完整，
+    # 剥不掉时 `<title>` 还在正文里 —— 用剥后的 `out` 匹配会漏。
+    if _FIRECRAWL_GW_RE.search(_raw):
+        log(f"firecrawl **网关 5xx**（瞬时抖动，不是东财故障、也不是额度）："
+            f"冷却 {FIRECRAWL_GATEWAY_COOLDOWN}s 后重试，本轮该接口数据缺失",
+            "FEED")
+        _fc_fail_set(time.time() + FIRECRAWL_GATEWAY_COOLDOWN)
+        return None
     return out or None
 
 
