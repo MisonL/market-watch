@@ -937,6 +937,96 @@ def _ai_stream_kind(buf: bytes) -> str:
     return "thinking" if _saw_think else "none"
 
 
+# 增量扫描器的"未完成行"上限（字节）。JSONL 单行实测最大几十 KB；
+# 留 1MB 纯属防御 —— 真出现超长无换行片段时截尾，最坏后果是**漏掉那一行**
+# 里的标记，而后续行会继续扫，不会让闸门卡死。
+_STREAM_SCAN_REST_MAX = 1 << 20
+
+
+class _StreamScanner:
+    """**增量**扫 stream-json 事件流，只处理新来的字节。
+
+    ## 为什么必须有它（2026-11-24，P1 性能/正确性）
+
+    原先 `run_with_idle_watchdog` 的 pump 线程**每收到一块**就做：
+
+        _all = b"".join(bufs[1])          # ① 把已累积的整个流重新拼一遍
+        _kind = _ai_stream_kind(_all)     # ② 再从头 split + 逐行扫一遍
+
+    而 read1 的块很小（一条 JSONL 几十~几百字节），于是同样的字节被扫了
+    **N 次**，总代价 O(N²)。`[实测]` 用思考密集流（thinking_delta 占绝大多数，
+    扫描不会早退）量出来的纯解析耗时：
+
+        累计 0.16MB ->  0.07s
+        累计 1.5MB  ->  6.8s
+        累计 2.3MB  -> 17.3s
+        累计 3.0MB  -> 28.7s
+
+    而生产 2026-11-24 09:19 那轮的事件流是 **12.4MB** —— 外推到那个量级
+    是**几分钟**的纯 CPU。这段 CPU 烧在 pump 线程上，而 pump 是子进程 stdout
+    的**唯一读者**：它一忙，64KB 的管道缓冲就填满，子进程 write 阻塞、
+    连模型输出都会跟着停住。于是「模型慢」和「读得慢」互相放大。
+
+    ## 语义必须与 `_ai_stream_kind` **完全一致**
+
+    判据原样照搬（非空正文才算 text、跨块的标记要认得出、空载荷不算），
+    只是把「每次重扫全量」换成「每次只扫新完成的整行」。跨块被 read1
+    拆开的行由 `_rest` 承接，下一块拼上再判 —— 与原实现"下一轮扫完整缓冲
+    自然会命中"的承诺等价。
+
+    `feed()` 在已判定 text 后直接返回：正文一旦出现，闸门就已解除，
+    再扫下去没有任何收益（这正是原实现最大的浪费来源）。
+    """
+
+    __slots__ = ("_rest", "kind", "saw_content", "_text_at")
+
+    def __init__(self):
+        # 上一块留下的**未完成行**（还没遇到换行）
+        self._rest = b""
+        # 'none'（还没见到任何东西）/ 'thinking'（只有思考）/ 'text'（有正文）
+        self.kind = "none"
+        # 是否出现过 `_AI_CONTENT_MARKS`（用于首字节闸门的解除）
+        self.saw_content = False
+        # 首次判定出非空正文的**单调钟**时刻；None = 还没有
+        self._text_at = None
+
+    def feed(self, chunk, now=None):
+        """喂一块新字节；返回 True 表示**本次**新判定出了正文。"""
+        if self.kind == "text" or not chunk:
+            return False
+        _data = self._rest + chunk
+        _cut = _data.rfind(b"\n")
+        if _cut < 0:
+            # 连一个完整行都还没凑出来 —— 只留尾巴，绝不再扫全量
+            self._rest = (_data if len(_data) <= _STREAM_SCAN_REST_MAX
+                          else _data[-_STREAM_SCAN_REST_MAX:])
+            return False
+        self._rest = _data[_cut + 1:]
+        if len(self._rest) > _STREAM_SCAN_REST_MAX:
+            self._rest = self._rest[-_STREAM_SCAN_REST_MAX:]
+        for _ln in _data[:_cut].split(b"\n"):
+            if not self.saw_content and any(_m in _ln
+                                            for _m in _AI_CONTENT_MARKS):
+                self.saw_content = True
+            # 判据与 `_ai_stream_kind` 逐行逻辑一一对应
+            if any(_m in _ln for _m in _AI_TEXT_MARKS):
+                _i = _ln.find(_AI_TEXT_PAYLOAD)
+                if _i >= 0:
+                    _r = _ln[_i + len(_AI_TEXT_PAYLOAD):]
+                    _j = _r.find(b'"')
+                    # 没找到收尾引号 = 这一行被 read1 截断了，本轮先不认；
+                    # 下一块拼上完整的行后会再判到。
+                    if _j >= 0 and _r[:_j].strip():
+                        self.kind = "text"
+                        self._text_at = (time.monotonic() if now is None
+                                         else now)
+                        return True
+            if self.kind == "none" and any(_m in _ln
+                                           for _m in _AI_THINK_MARKS):
+                self.kind = "thinking"
+        return False
+
+
 def ai_output_args() -> list[str]:
     """拼进 claude CLI 命令行的输出模式参数（ai_model_args 的同款套路）。
 
@@ -1265,7 +1355,15 @@ def run_with_idle_watchdog(args, idle_limit=None, first_byte_limit=None,
     # thinking 流会让 _content_ts 有值（首字节闸门解除），但不能解除下面的
     # 「零正文」硬闸门。见 `_ai_stream_kind` 的说明。
     _text_ts: list[float | None] = [None]
-    _saw_think = [False]
+    # ⚠️⚠️ 2026-11-24（P1）：**增量**扫描器替代"每块重扫全量"。
+    # 见 `_StreamScanner` 的注释 —— 原实现是 O(N²)，12.4MB 的流要烧掉
+    # 几分钟纯 CPU，而 pump 是子进程 stdout 的唯一读者，它一忙管道就填满、
+    # 模型输出跟着被憋住。这里换成只扫新完成的行。
+    _scan = [_StreamScanner() if _want_stream else None]
+    # ⚠️ 2026-11-24：原 pump 里还有个 `_saw_think = [False]`，在 thinking
+    # 分支被置 True、正文分支置 False —— 但**全仓库没有任何地方读它**。
+    # 写而不读的死状态会让后来者以为"思考流有专门的处置"，实际没有。
+    # 删掉。（判断思考流类型的能力由 `_StreamScanner.kind` 承担。）
     # ⚠️ 必须用单调钟（2026-10-15 组合场景复核）：macOS 睡眠期间
     # time.time() 照走而子进程被一起挂起 —— 死机/合盖恢复后墙钟 idle
     # 一瞬间超过 AI_IDLE_LIMIT，把"睡眠"误判成"AI 卡死"，杀掉本来
@@ -1304,19 +1402,21 @@ def run_with_idle_watchdog(args, idle_limit=None, first_byte_limit=None,
                 if idx == 2 and _reject_ts[0] is None:
                     if b"unrecognized_model" in b"".join(bufs[2]):
                         _reject_ts[0] = time.monotonic()
-                # 正文事件首次到达（stream-json 专用，与上面的 reject 标记
-                # 同款：判**累积缓冲**而不是单块 —— JSONL 行会被 read1 拆在
-                # 两块里，单块判会漏。每轮拼接的开销与 stderr 扫描同量级）。
-                if idx == 1 and _want_stream and _content_ts[0] is None:
-                    _all = b"".join(bufs[1])
-                    if any(_m in _all for _m in _AI_CONTENT_MARKS):
+                # 正文事件首次到达（stream-json 专用）。
+                # ⚠️ 2026-11-24：改由 `_StreamScanner` **增量**承接 ——
+                # 它自己保留跨块的半行（`_rest`），所以"JSONL 行被 read1
+                # 拆在两块里"这个坑仍然被正确处理，但**不再重拼全缓冲**。
+                # 原实现的 `b"".join(bufs[1])` + 全量重扫是 O(N²)，
+                # 12.4MB 的流派下来是几分钟纯 CPU，而 pump 是子进程 stdout
+                # 的唯一读者 —— 详见 `_StreamScanner` 的注释。
+                if idx == 1 and _want_stream and _scan[0] is not None:
+                    # ⚠️ 只喂**这一块新字节**，绝不重拼全缓冲。
+                    _sc = _scan[0]
+                    _sc.feed(chunk)
+                    if _content_ts[0] is None and _sc.saw_content:
                         _content_ts[0] = time.monotonic()
-                if idx == 1 and _want_stream:
-                    _kind = _ai_stream_kind(b"".join(bufs[1]))
-                    if _kind == "text" and _text_ts[0] is None:
-                        _text_ts[0] = time.monotonic()
-                    elif _kind == "thinking":
-                        _saw_think[0] = True
+                    if _sc.kind == "text" and _text_ts[0] is None:
+                        _text_ts[0] = _sc._text_at or time.monotonic()
         except Exception:
             pass
         finally:
