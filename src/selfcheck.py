@@ -10862,7 +10862,18 @@ def _main(ok_all):
     #
     # ⚠️ 已知边界（写出来避免高估本项）：参考集是**跨文件全局**的，故
     # "A 模块定义 foo（死）、B 模块也定义并用了 foo" 时 A 的 foo 会被漏报。
-    _dc_allow = set()            # 确需保留但当前无静态引用的符号（每条写理由）
+    # 确需保留但当前无静态引用的符号（每条写理由）。
+    #
+    # `_ai_stream_kind`（2026-11-24 加入）：生产已经不用它了 ——
+    # pump 改由 `_StreamScanner` 增量扫描（原实现每块重拼全缓冲，O(N²)，
+    # 12.4MB 的流要烧分钟级 CPU，详见 `_StreamScanner` 的注释）。
+    # 但它**刻意保留**，作为可执行的规格：
+    # `tests/test_ai_stream_incremental.py` 拿同一份输入同时喂两个实现、
+    # 断言结论一致。没有这个参照物，"增量版的判据有没有跑偏"就只能靠肉眼
+    # 比对两百行注释 —— 而这个判据正是四道闸门（首字节/正文/idle/总时长）
+    # 的解除条件，偏一点就是误杀或永不终止。
+    # 本项的参考集只扫 `src/`，扫不到 `tests/`，故必须在这里显式豁免。
+    _dc_allow = {"_ai_stream_kind"}
     _dc_bad = []
     try:
         import ast as _ast_dc
@@ -10964,6 +10975,37 @@ def _main(ok_all):
                                f"（死常量？指向的文件可能真实存在，最坑）")
             else:
                 _dc_bad.append(f"{_dcdf}:{_dcln} 顶层 {_dcnm}() 无任何引用（死代码？）")
+        # ⚠️⚠️ 2026-11-24：**豁免名单本身必须被检查**，否则它是个洞。
+        #
+        # `_dc_allow` 的设计意图是"确有理由保留、但静态引用扫不到"，
+        # 而"扫不到"最常见的原因恰恰是**它真的没人用**。不加约束的话，
+        # 下一次报死代码时最省事的做法就是往这个集合里塞一个名字、
+        # 写一句听起来合理的话 —— 判据从此对那个符号永久失效，
+        # 而自检仍然全绿。
+        #
+        # 判据：名单里每个名字都必须在**测试里**被真正引用。
+        # 这正好覆盖设计意图（保留的理由是"作为规格被测试比对"），
+        # 而把"懒得删"挡在外面 —— 那种名字不会有任何测试引用它。
+        for _dcn3 in sorted(_dc_allow):
+            _dc_hit = False
+            for _dcf3 in sorted(os.listdir(SRC)):
+                if not _dcf3.endswith(".py"):
+                    continue
+                try:
+                    _dc3 = open(os.path.join(SRC, _dcf3),
+                                encoding="utf-8").read()
+                except OSError:
+                    continue
+                # 只认**调用/属性**形态，不认注释或字符串里提到
+                if (f"{_dcn3}(" in _dc3
+                        or f'.{_dcn3}' in _dc3.replace(f"def {_dcn3}", "")):
+                    _dc_hit = True
+                    break
+            if not _dc_hit:
+                _dc_bad.append(
+                    f"_dc_allow 里的 {_dcn3!r} 豁免了死代码检查，"
+                    f"但全库没有任何调用/属性引用 —— "
+                    f"豁免理由不成立（拆东墙：判据对它是永久失效的）")
     except Exception as _e_dc:
         _unverified[0] += 1
         print(f"  ⚠️  死代码扫描无法完成: {type(_e_dc).__name__}: {_e_dc}"
