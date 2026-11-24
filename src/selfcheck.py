@@ -3581,14 +3581,33 @@ def _main(ok_all):
         #    ⚠️ 只在**盘上日期==今天**时比对：跨午夜瞬间 `_roll()` 把日期
         #    翻到今天、count 归零但**不落盘**（落盘只发生在 `_reserve()`），
         #    此时盘上仍是昨天的记录，比对必然假红 —— 那正是合法的跨天基准。
+        #    ⚠️⚠️ 但**不能要求严格相等**（2026-11-24，实测假红）：
+        #    自检本身要跑 10~20 分钟，这期间 launchd 的 collect/analyze
+        #    还在 300s 一轮地跑。`stats()` 读到 count=224 之后、这里再读
+        #    盘上时，另一进程完全可能已经 `_reserve()` 了一次 —— 实测
+        #    `内存=224 盘上=225`，只差 1，却报「跨进程同步已坏」。
+        #    那是个**假 ❌**：竞态合法，不是缺陷。
+        #
+        #    方向必须分清（这是本条判据的真正含义）：
+        #      · **盘上 > 内存** —— 两次读之间别的进程加了配额。
+        #        完全正常，只留一行 ℹ️ 便于排查，永不置红。
+        #      · **盘上 < 内存** —— 盘上的计数**倒退**了。这才是
+        #        `_roll` 跨进程同步真的坏掉（别人的占额看不见 ->
+        #        会超发 -> 有过被封 IP 的历史）。必须红。
         try:
             _disk_rl = M._load_json(M.RL.RATE_FILE, {}) or {}
             if isinstance(_disk_rl, dict) and _disk_rl.get("date") == M.RL.day:
                 _dc_rl = _disk_rl.get("count")
-                if _dc_rl != _cnt_rl:
-                    _bad_rl.append(f"count 与盘上 rate.json 分叉："
-                                   f"内存={_cnt_rl} 盘上={_dc_rl}"
-                                   f"（_roll 的跨进程同步已坏）")
+                if isinstance(_dc_rl, int) and _dc_rl < _cnt_rl:
+                    _bad_rl.append(
+                        f"count 与盘上 rate.json 分叉：内存={_cnt_rl} "
+                        f"盘上={_dc_rl} —— 盘上**倒退**了，"
+                        f"_roll 的跨进程占额真的丢了（会超发请求）")
+                elif isinstance(_dc_rl, int) and _dc_rl > _cnt_rl:
+                    # 并发增量：良性。留痕但不置红。
+                    print(f"  ℹ️  盘上 count 比内存多 {_dc_rl - _cnt_rl}"
+                          f"（{_cnt_rl}->{_dc_rl}）—— 对账期间另一进程"
+                          f"占用了配额，属正常并发，非缺陷")
         except Exception as _rl_e:
             _bad_rl.append(f"rate.json 无法对账: {type(_rl_e).__name__}: {_rl_e}")
     except Exception as _rl_e2:
