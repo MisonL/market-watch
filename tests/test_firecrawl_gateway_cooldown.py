@@ -110,11 +110,32 @@ check("_fc_fail_set(time.time() + FIRECRAWL_GATEWAY_COOLDOWN)" in _src,
       "识别到网关 5xx 后没有武装**短**冷却 —— 等于识别了不处置")
 
 # ---------- ⑤ 行为：真的走短冷却 ----------
+#
+# ⚠️⚠️ 这一段必须把**可用性闸门**也桩掉，否则在 CI 上恒真地"通过失败"。
+#
+# 第一版只桩了 `subprocess.run`，本地全绿、CI 却红：
+#     ❌ 冷却被设成 -1795492853s，不是网关档的 120s
+# 负值意味着 `_fc_fail_get()` 返回 0 —— 冷却根本没被写。
+# 原因是 `firecrawl_get` 开头还有一道闸门：
+#     if not (os.path.exists(_FIRECRAWL_NODE)
+#             and os.path.exists(_FIRECRAWL_CLI)):
+#         return None
+# CI 的 runner 上没有 node、也没有 firecrawl CLI，于是**在到达分类逻辑之前
+# 就返回了**，`_fc_fail_set` 一次都没调用。
+#
+# 这不是被测代码的缺陷，是**测试依赖了环境**（本仓库今天第三次栽在这个
+# 形态上：agent 用例依赖 agent/ 目录、性能用例依赖 GC 抖动）。修法是把
+# 这两个路径指向一个必然存在的文件，让流程真正走到分类分支 ——
+# 我们要验的是"分类对不对"，不是"这台机器装没装 firecrawl"。
 import tempfile
 _mark = os.path.join(tempfile.mkdtemp(), "fc.json")
 _orig_file = M._FC_FAIL_FILE
+_orig_node, _orig_cli = M._FIRECRAWL_NODE, M._FIRECRAWL_CLI
 try:
     M._FC_FAIL_FILE = _mark
+    # 让可用性闸门放行（`sys.executable` 必然存在）
+    M._FIRECRAWL_NODE = sys.executable
+    M._FIRECRAWL_CLI = sys.executable
     M._fc_fail_set(0)                      # 清冷却
     check(M._fc_fail_get() == 0, "前置：冷却未清空")
 
@@ -132,12 +153,16 @@ try:
     check(_got is None, "网关 5xx 应返回 None（不能把错误页当数据交出去）")
     import time as _t
     _until = M._fc_fail_get()
+    check(_until > 0,
+          "冷却一次都没被武装 —— 流程八成在可用性闸门就返回了，"
+          "本段断言没测到分类逻辑")
     _left = _until - _t.time()
     check(0 < _left <= M.FIRECRAWL_GATEWAY_COOLDOWN + 5,
           f"冷却被设成 {_left:.0f}s，不是网关档的 "
           f"{M.FIRECRAWL_GATEWAY_COOLDOWN}s —— 又按通用 900s 处置了")
 finally:
     M._FC_FAIL_FILE = _orig_file
+    M._FIRECRAWL_NODE, M._FIRECRAWL_CLI = _orig_node, _orig_cli
     try:
         os.unlink(_mark)
     except OSError:
