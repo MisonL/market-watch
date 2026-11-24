@@ -27,8 +27,21 @@ prompt 里早就写明了「没触发就一句『本轮无阈值触发』即可�
 ⑥ 兜底模板 hits 为空时也**不渲染**该段 —— 代码不能要求 AI 做自己没做的事
 """
 import os
-import re
 import sys
+import tempfile
+
+# ⚠️⚠️ 必须在 `import analyze` **之前**把 MW_DIR 指向临时目录。
+#
+# `_collapse_empty_trigger` 成功时会调 `_log(...)`，而 `_log` 写的是
+# `MW_DIR/logs/watch.log` —— 不沙箱就是**生产日志**。
+# `[实测]` 2026-11-24：我连跑 6 次注入验证，生产 watch.log 里多出
+# 28 行「无阈值触发段已并入标题」，第一眼以为是生产在**每轮重复记账**
+# （一条推送记 6 次），排查了一轮才发现是自己的测试写的。
+#
+# `tests/run_all.sh` 会给每个用例建沙箱，所以 CI 不受影响 ——
+# 但**直接跑单个用例**（开发时最常用）会污染生产。
+# 本文件自带走 MW_DIR 兜底，不依赖外层。
+os.environ.setdefault("MW_DIR", tempfile.mkdtemp(prefix="mw_t_emptytri_"))
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src"))

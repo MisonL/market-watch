@@ -24,6 +24,48 @@ if _MW_DIR_ENV is not None and not _MW_DIR_ENV.strip():
 DIR = (_MW_DIR_ENV if _MW_DIR_ENV is not None
        else os.path.expanduser("~/.market-watch"))
 
+# ⚠️⚠️ 2026-11-24：**"我是不是在被测试调用"是一等事实，必须在这里算一次。**
+#
+# 起因：`tests/run_all.sh` 会给每个用例建沙箱 `MW_DIR`，全量跑与 CI 都干净；
+# 但**直接跑单个用例**（开发时最常用）走的是生产根 —— 而这些用例调的函数
+# 会 `_log(...)`，`_log` 写的是 `MW_DIR/logs/watch.log`。
+#
+# `[实测]` 单跑一次写入生产 watch.log 的行数：
+#     test_split_wall_hang.py        751 行（对几千个随机串调拆行）
+#     test_wrap_no_unit_split.py       6 行
+#     test_empty_trigger_section.py    6 行
+#     test_firecrawl_gateway_cooldown  2 行
+#     test_sector_round_share.py       1 行
+#
+# 危害不只是"日志脏了"：我看到生产日志里 14:25 连着 6 行
+# 「无阈值触发段已并入标题」，判断成「生产每轮重复记账、一条推送记 6 次」，
+# **排查了一整轮**才想到是自己的测试写的。误判成本远高于日志体积。
+#
+# 判定方式：看**主脚本路径里有没有 `/tests/`**。
+#   · 生产由 launchd 跑 `src/analyze.py` 等 —— 路径含 `/src/`，不命中；
+#   · 测试是 `python3 tests/xxx.py` —— 命中。
+# ⚠️ 用 `os.path.abspath` 而不用 `argv[0]` 原样：`python3 -c` 时 argv[0]
+# 是 `-c`，`abspath("-c")` 落在当前目录，不会误命中 tests/。
+IS_TEST_PROCESS = False
+try:
+    import sys as _sys_probe
+    _argv0 = (_sys_probe.argv[0] if _sys_probe.argv else "") or ""
+    if _argv0 and _argv0 not in ("-c", "-m", ""):
+        _p_abs = os.path.abspath(_argv0)
+        IS_TEST_PROCESS = (os.sep + "tests" + os.sep) in _p_abs
+except Exception:
+    IS_TEST_PROCESS = False
+
+# 生产根（未被 MW_DIR 覆盖时的那个）。用于判断"这次写是不是在写穿线上"。
+PROD_DIR = os.path.expanduser("~/.market-watch")
+IS_PROD_ROOT = (os.path.normpath(DIR) == os.path.normpath(PROD_DIR))
+
+
+def is_writing_through():
+    """测试进程 + 落在生产根 = **正在写穿线上**。日志据此自保。"""
+    return bool(IS_TEST_PROCESS and IS_PROD_ROOT)
+
+
 # 本文件所在 = src/（11 个 .py 所在）。SRC 语义：源码目录。
 MAIN_ROOT = os.path.dirname(os.path.abspath(__file__))
 

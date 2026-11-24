@@ -30,11 +30,18 @@
 ③ 反面控制：把修复退回去（只留 `isdigit()` 守卫），用例必须变红
 ④ 不得因为加了这条守卫就把行切得过短（每条续行至少要有实质内容）
 """
+import tempfile
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src"))
+
+# ⚠️ 必须在 import 之前把 MW_DIR 指向临时目录 —— 这些函数成功时会
+# `_log(...)`，而 `_log` 写的是 `MW_DIR/logs/watch.log`（生产日志）。
+# `tests/run_all.sh` 会给每个用例建沙箱，CI 不受影响；但**直接跑
+# 单个用例**会污染生产日志。本文件自带兜底，不依赖外层。
+os.environ.setdefault("MW_DIR", tempfile.mkdtemp(prefix="mw_t_wrap_"))
 
 import analyze as A
 

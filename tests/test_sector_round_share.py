@@ -45,6 +45,12 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src"))
 
+# ⚠️ 必须在 import 之前把 MW_DIR 指向临时目录 —— 这些函数成功时会
+# `_log(...)`，而 `_log` 写的是 `MW_DIR/logs/watch.log`（生产日志）。
+# `tests/run_all.sh` 会给每个用例建沙箱，CI 不受影响；但**直接跑
+# 单个用例**会污染生产日志。本文件自带兜底，不依赖外层。
+os.environ.setdefault("MW_DIR", tempfile.mkdtemp(prefix="mw_t_share_"))
+
 import marketlib as M
 
 _ok = 0

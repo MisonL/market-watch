@@ -458,6 +458,19 @@ def _rotate_log():
         pass
 
 def log(m, tag=""):
+    # ⚠️⚠️ 2026-11-24：**测试进程不得写穿生产日志**。
+    # 判定与理由见 `paths.is_writing_through` 上方（单跑一次可写 751 行）。
+    # 这里只拦**日志写入**，不改任何读路径 —— 测试仍读生产 conf/state，
+    # 行为与之前一致；只是不再污染线上 watch.log。
+    # ⚠️ 不能静默丢弃：打到 stderr，单跑时看得到，也让"日志被抑制"可被发现。
+    try:
+        import paths as _P
+        if _P.is_writing_through():
+            import sys as _sys
+            _sys.stderr.write(f"[test-suppressed] {m}\n")
+            return
+    except Exception:
+        pass
     try:
         _rotate_log()
         # ⚠️ 必须用 os.open(..., 0o600) 创建。原先 `open(LOG, "a")` 在文件

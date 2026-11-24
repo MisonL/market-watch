@@ -28,9 +28,19 @@ launchd每300s起的新轮全被挡，当天后续推送**全部消失**。
 import os
 import signal
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+
+# ⚠️⚠️ 必须在 `import analyze` **之前**把 MW_DIR 指向临时目录。
+# `_split_wall_lines` 命中时会 `_log(...)`，而 `_log` 写的是
+# `MW_DIR/logs/watch.log` —— 不沙箱就是**生产日志**。
+# `[实测]` 本用例单跑一次就往生产 watch.log 里写了 **751 行**
+# （它对几千个随机串调拆行，每次命中都记一条）。
+# `tests/run_all.sh` 会给每个用例建沙箱，所以 CI 与全量跑都不受影响 ——
+# 但**直接跑单个用例**（开发时最常用）会污染生产。
+os.environ.setdefault("MW_DIR", tempfile.mkdtemp(prefix="mw_t_splithang_"))
 
 import analyze as A # noqa: E402
 
