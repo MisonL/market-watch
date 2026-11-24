@@ -82,23 +82,36 @@ check('if "vr" not in r:' not in _code_hot,
       "`head[vr_done:]` 的补标记循环仍在用 `if \"vr\" not in r:` —— "
       "`vr` 在构造时就写进每一行了，这个条件**恒为假**，"
       "整段等于空操作（预算耗尽时 `_vr_ok` 永远补不上）")
+# 自算失败分支必须**退回 f10**，不能写死 False
+check('_vr_src") == "f10"' in _code_hot or "_vr_src') == 'f10'" in _code_hot,
+      "自算失败分支没有退回 f10 的判据 —— 自算一失败就把现成的 f10 扔掉，"
+      "报「量比未知」而其实有真值")
 check('r["_vr_ok"] = False' in _code_hot,
       "补标记循环里没有 `r[\"_vr_ok\"] = False` —— 没算到的行仍会被当成可信")
 
 # ---------- ① / ② 行为级：真跑 hot.analyze ----------
 import hot  # noqa: E402
 
-_RAW = [{"f12": "BK%04d" % i, "f14": "板块%d" % i, "f3": 1.0, "f24": -20.0,
-         "f6": 5e8, "f184": 3.0, "f69": 1.0, "f8": 1.0, "f62": 1e8,
-         "f104": 50, "f105": 10, "f128": "龙头", "f134": 100, "_tag": "ind"}
-        for i in range(40)]
+def _raw(f10=None):
+    """40 个板块；`f10` 传 None 表示接口没给这个字段。"""
+    out = []
+    for i in range(40):
+        r = {"f12": "BK%04d" % i, "f14": "板块%d" % i, "f3": 1.0,
+             "f24": -20.0, "f6": 5e8, "f184": 3.0, "f69": 1.0, "f8": 1.0,
+             "f62": 1e8, "f104": 50, "f105": 10, "f128": "龙头",
+             "f134": 100, "_tag": "ind"}
+        if f10 is not None:
+            r["f10"] = f10
+        out.append(r)
+    return out
 
 _sv = (hot.fetch_sectors, hot.members, M.data_cap, hot.kline_stats)
-hot.fetch_sectors = lambda: [dict(x) for x in _RAW]
+hot.fetch_sectors = lambda: _raw()
 hot.members = lambda c: set(range(20))
 try:
-    # ① 预算一进门就耗尽
+    # ① 预算一进门就耗尽，且接口**没有** f10 -> 必须报未知
     M.data_cap = lambda own, what="": -9
+    hot.fetch_sectors = lambda: _raw(None)
     _rA = hot.analyze(top=8)
     check(bool(_rA["strong"]), "预算耗尽时 strong 为空 —— 探针没跑起来")
     for _r in _rA["strong"][:3] + _rA["top_up"][:3] + _rA["top_dn"][:3]:
@@ -109,7 +122,51 @@ try:
               f"预算耗尽时 {_r['name']!r} 的 `_vr_ok` 是 {_r['_vr_ok']!r} —— "
               f"应为 False（vr={_r['vr']} 是 `_num('-', 1.0)` 的兜底常数）")
 
+    # ①b 预算耗尽但 **f10 有效** -> 必须认它是真值，不能一起报未知
+    #
+    # ⚠️ 这一条是**反向**守卫，专门防"矫枉过正"：修①的时候很容易一律标
+    # `_vr_ok=False`，那会把 f10 这个真值也藏掉。
+    # `[实测]` 2026-11-24 全量扫描：f10 有效 **600/600**，与自算比值
+    # 0.98~1.27（中位 1.08）—— 同一个量、同一量纲。
+    hot.fetch_sectors = lambda: _raw(1.3)
+    _rA2 = hot.analyze(top=8)
+    check(bool(_rA2["strong"]), "预算耗尽+f10 时 strong 为空 —— 探针没跑起来")
+    _x = _rA2["strong"][0]
+    check(_x.get("_vr_ok") is True,
+          f"预算耗尽但 f10=1.3 有效时 `_vr_ok` 是 {_x.get('_vr_ok')!r} —— "
+          f"f10 是接口真值（实测 600/600 有效），不该被一起藏成「未知」")
+    check(abs(_x["vr"] - 1.3) < 1e-9,
+          f"预算耗尽时 vr={_x['vr']} —— 应为 f10 的 1.3，不是兜底常数 1.0")
+    check(_x.get("_vr_src") == "f10",
+          f"预算耗尽+f10 时 `_vr_src` 是 {_x.get('_vr_src')!r} —— 应为 'f10'"
+          f"（出处要可查，否则日后分不清'a 是自算的'还是'是接口给的'）")
+
+    # ①c 自算**失败**（K 线取不到，但预算够）-> 退回 f10
+    #
+    # ⚠️ 这一格是①b 抓不到的：①b 的预算一进门就 break，根本进不到
+    # `kline_stats` 那一趟；而"走了这一趟、但返回 None"是**另一条路径**
+    # （分页不够 / K 线接口挂 / 该板块无日K）。第一版缺这条，把
+    # 「自算失败不退回 f10」注入进去，24 条断言**全绿** —— 实测确认。
+    # ⚠️ 必须先**放开预算**。上一格把 `data_cap` 桩成 -9，若不恢复，
+    # `for r in head` 会一进门就 break，`kline_stats` **一次都不被调用** ——
+    # 于是"自算失败退回 f10"这条路径根本没走到，断言恒真。
+    # 第一版就是这样绿的（注入"自算失败不退回 f10"仍 28 条全绿，实测确认）。
+    M.data_cap = lambda own, what="": own
+    hot.fetch_sectors = lambda: _raw(1.3)
+    hot.kline_stats = lambda c, a, now=None, budget_s=None: (None, None)
+    _rA3 = hot.analyze(top=8)
+    check(bool(_rA3["strong"]), "自算失败+有 f10 时 strong 为空 —— 探针没跑起来")
+    _x3 = _rA3["strong"][0]
+    check(_x3.get("_vr_ok") is True,
+          f"自算返回 None 但 f10=1.3 时 `_vr_ok` 是 {_x3.get('_vr_ok')!r} —— "
+          f"应退回 f10 并标可信（不是报「未知」）")
+    check(abs(_x3["vr"] - 1.3) < 1e-9,
+          f"自算返回 None 时 vr={_x3['vr']} —— 应为 f10 的 1.3")
+    check(_x3.get("_vr_src") == "f10",
+          f"自算返回 None 时 `_vr_src` 是 {_x3.get('_vr_src')!r} —— 应为 'f10'")
+
     # ② 预算充足：算出值的行必须 True（不能一刀切全标未知）
+    hot.fetch_sectors = lambda: _raw(1.3)
     M.data_cap = lambda own, what="": own
     hot.kline_stats = lambda c, a, now=None, budget_s=None: (1.7, -25.0)
     _rB = hot.analyze(top=8)
@@ -119,6 +176,9 @@ try:
           f"应为 True（kline_stats 返回了 1.7，这是真算出来的）")
     check(abs(_rB["strong"][0]["vr"] - 1.7) < 1e-9,
           f"预算充足时 vr={_rB['strong'][0]['vr']} —— 应为 1.7")
+    check(_rB["strong"][0].get("_vr_src") == "kline",
+          f"预算充足时 `_vr_src` 是 {_rB['strong'][0].get('_vr_src')!r} —— "
+          f"应为 'kline'（自算的是精算值，要能与 f10 区分）")
 finally:
     (hot.fetch_sectors, hot.members, M.data_cap, hot.kline_stats) = _sv
 
@@ -171,9 +231,12 @@ check("量比1.7" in _b3,
       f"      {[x for x in _b3.split(chr(10)) if '文娱用品' in x][:1]!r}")
 
 # ---------- ⑥ 构造时就要有默认值 ----------
-_i = _code_hot.find("_vr_ok=False,")
-check(_i > 0,
-      "行构造处没有 `_vr_ok=False` —— 默认值仍靠「走完 kline_stats 才有」，"
-      "预算耗尽时整批行没有这个键")
+check("_vr_ok=M.isnum(x.get(\"f10\"))" in _code_hot
+      or "_vr_ok=M.isnum(x.get('f10'))" in _code_hot,
+      "行构造处没有按 f10 决定 `_vr_ok` —— 默认值仍靠"
+      "「走完 kline_stats 才有」，预算耗尽时整批行没有这个键")
+check('_vr_src=' in _code_hot,
+      "行构造处没有 `_vr_src` —— 分不清「这个 vr 是自算的还是 f10 给的」"
+      "（日后查 15:09 那类缺陷就无从下手）")
 
 print(f"ALL PASS (量比「没算过」不得印成 1.0 {_ok} 个断言)")

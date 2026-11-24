@@ -848,9 +848,14 @@ def t_vr_missing_not_shown_as_one():
     # ① **数据层**：走真实的 `hot.analyze()`，验证 K 线取数失败时会标 `_vr_ok=False`。
     # ⚠ 上一版只直接构造 `{"_vr_ok": False}` 字典 → 测的是**渲染器**，
     # 把 hot.py 里那行 `_vr_ok = bool(M.isnum(vr))` 改成 `True` 也不会变红（实测确认）。
+    # ⚠️ 2026-11-24：**去掉 `f10`**（原来写的是 1.0）。
+    # 现在的口径是三态：自算成功 -> kline；自算失败但有 f10 -> 退回 f10
+    # （f10 实测 600/600 有效，是真值）；**连 f10 都没有** -> 才报未知。
+    # 本条要验的是最后一格，所以夹具里不能有 f10 —— 否则测的是"退回 f10"，
+    # 而断言写的是 False，两边对不上（会变成一条永远读不懂的红）。
     _row = {"f12": "BK001", "f14": "AI应用", "_tag": "ind", "f3": 2.0,
             "f24": -1.0, "f6": 4e8, "f134": 10.0, "f184": 10.0, "f69": 8.0,
-            "f10": 1.0, "f8": 2.0, "f62": 5e8, "f104": 30, "f105": 10,
+            "f8": 2.0, "f62": 5e8, "f104": 30, "f105": 10,
             "f128": "龙头"}
     _ofs, _omb, _oks = _H.fetch_sectors, _H.members, _H.kline_stats
     _H.fetch_sectors = lambda: [dict(_row)]
@@ -864,7 +869,28 @@ def t_vr_missing_not_shown_as_one():
     check(_hs is not None, "hot.analyze() 未产出 strong 行（夹具失效）")
     if _hs is not None:
         check(_hs.get("_vr_ok") is False,
-              f"K 线取数失败时应标 `_vr_ok=False`，实得 {_hs.get('_vr_ok')!r}")
+              f"K 线取数失败且**无 f10** 时应标 `_vr_ok=False`，"
+              f"实得 {_hs.get('_vr_ok')!r}")
+        # 对照：同一行**有** f10 时必须退回它（那是真值，不是兜底常数）
+        # ⚠️ `members` / `kline_stats` 的桩在上一个 finally 里已还原，
+        # 这里必须重新装 —— 否则 `members()` 会走真网络（一次请求 5~8s），
+        # `kline_stats` 也会真拉 K 线，strong 可能为空，报出来是
+        # 「实得 _vr_ok='?'」这种看不懂的错（实测第一版就是这样）。
+        _row2 = dict(_row, f10=1.3)
+        _H.fetch_sectors = lambda: [dict(_row2)]
+        _H.members = lambda code: set(str(i) for i in range(12))
+        _H.kline_stats = lambda *a, **k: (None, None)
+        try:
+            _hr2 = _H.analyze()
+        finally:
+            _H.fetch_sectors, _H.members, _H.kline_stats = _ofs, _omb, _oks
+        _hs2 = (_hr2.get("strong") or [None])[0]
+        check(_hs2 is not None and _hs2.get("_vr_ok") is True,
+              f"K 线失败但 f10=1.3 有效时应退回 f10 并标可信，"
+              f"实得 _vr_ok={_hs2.get('_vr_ok') if _hs2 else '?'!r}")
+        check(_hs2 is not None and abs(_hs2.get("vr", 0) - 1.3) < 1e-9,
+              f"K 线失败但 f10=1.3 时 vr={_hs2.get('vr') if _hs2 else '?'!r} "
+              f"—— 应为 1.3")
 
     _base = dict(name="半导体", chg=-2.0, f24=-5.0, _f24_ok=True,
                  pct=3.0, lead="某某", amt=4e8, stage="延续")
