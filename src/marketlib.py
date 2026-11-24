@@ -2253,6 +2253,32 @@ FIRECRAWL_TIMEOUT = 90          # 单次抓取上限（云端抓取通常 5~20s�
 _FC_FAIL_FILE = p_cache("firecrawl_fail.json")
 
 
+# ⚠️⚠️ 2026-11-24 第三次修（前两次都是"给单个入口开小灶"，这里是治类）：
+#
+# 同一个缺陷已经出现过三次，每次都是**换一个入口**：
+#   ① 限流     -> 套 900s（11-23 修成 60s）
+#   ② 网关 5xx -> 套 900s（11-24 修成 120s）
+#   ③ 调用超时 -> 套 900s（本条）
+# `[实测]` 13:09:00：`firecrawl 调用异常: TimeoutExpired ... timed out after 40 seconds`
+# -> 900s 冷却 -> 13:09~13:24 整整 15 分钟板块数据全无（13:14 那一轮
+#    `clist 完全取不到`、两个 fs 的资金两端都返回 0 条）。
+#
+# 结构性问题不在"还有哪个入口没开小灶"，而在**默认值**：
+# 所有未分类失败一律 900s。而观察到的失败形态**全都是瞬时的**
+# —— 限流、网关抖动、超时、空输出，没有一个是"这台源真的挂了"。
+# 用 15 分钟惩罚一次 40 秒的超时，是 22 倍的过度惩罚。
+#
+# 全历史代价（logs/watch.log）：
+#   调用异常 12 次 + 无输出 31 次 + 非 JSON 21 次 = 64 次 × 900s ≈ 16 小时冷却
+#
+# 所以改成**按连续失败次数递增**：第一次给 120s（大概率已恢复），
+# 连续失败才加码到 900s 上限；任一次成功即清零。
+# 这样既不再过度惩罚瞬时抖动，又能把"真的挂了"隔离住 ——
+# 而且**不用预先知道下一个入口长什么样**。
+FC_ESCALATE_BASE = 120      # 首次失败的冷却
+FC_ESCALATE_MAX = 900       # 冷却上限（连续失败时的封顶）
+
+
 def _fc_fail_get():
     """读冷却截止时刻（跨进程）。失败/损坏一律返回 0.0（不冷却）。"""
     try:
@@ -2268,6 +2294,51 @@ def _fc_fail_set(until):
         _atomic_write_json(_FC_FAIL_FILE,
                            {"until": until,
                             "t": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    except Exception:
+        pass
+
+
+def _fc_fail_bump():
+    """未分类失败：按**连续失败次数**递增冷却（120s -> 240 -> 480 -> 900 封顶）。
+
+    与 `_fc_fail_set(until)` 的区别：那个是"我已经知道这次故障该罚多久"
+    （限流 60s、网关 120s），这个是"我不知道，让连续失败次数告诉我"。
+
+    ⚠️ 计数与冷却截止时刻写在**同一个文件**里：分两个文件会出现
+    "计数清零了但冷却还在"（或反过来）的中间态 —— 那正是本仓库反复
+    修的「同一真值抄两份」。
+    """
+    _n = 1
+    try:
+        _d = _load_json(_FC_FAIL_FILE, {}) or {}
+        _prev = _d.get("n")
+        _n = (int(_prev) + 1) if isnum(_prev) and int(_prev) >= 1 else 1
+    except Exception:
+        _n = 1
+    _delay = min(FC_ESCALATE_BASE * (2 ** (_n - 1)), FC_ESCALATE_MAX)
+    try:
+        _atomic_write_json(_FC_FAIL_FILE,
+                           {"until": time.time() + _delay,
+                            "n": _n,
+                            "t": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    except Exception:
+        pass
+    return _delay, _n
+
+
+def _fc_ok():
+    """firecrawl 成功一次 -> 连续失败计数清零。
+
+    ⚠️ 必须**真的清**，不能只在内存里清：本进程每 300s 就被 launchd
+    重起，内存里的计数活不过一轮。
+    ⚠️ 只清计数、**不动** `until`：成功的那次调用本来就已经过了冷却
+    （否则它根本不会被发出），无谓改写只会放大并发写冲突。
+    """
+    try:
+        _d = _load_json(_FC_FAIL_FILE, {}) or {}
+        if isinstance(_d, dict) and _d.get("n"):
+            _d["n"] = 0
+            _atomic_write_json(_FC_FAIL_FILE, _d)
     except Exception:
         pass
 
@@ -2715,8 +2786,15 @@ def firecrawl_get(url, timeout=None):
              "--max-age", "0", url],
             capture_output=True, text=True, timeout=_to)
     except Exception as e:
-        log(f"firecrawl 调用异常: {type(e).__name__}: {e}", "FEED")
-        _fc_fail_set(time.time() + FIRECRAWL_COOLDOWN)
+        # ⚠️⚠️ 2026-11-24（P1，实测）：**超时不是源故障**，不能套 900s。
+        # `[实测]` 13:09:00 `TimeoutExpired: ... timed out after 40 seconds`
+        # -> 900s 冷却 -> 13:09~13:24 整整 15 分钟板块数据全无。
+        # 一次 40 秒的超时罚 900 秒，是 22 倍过度惩罚。改走递增冷却。
+        _dl, _n = _fc_fail_bump()
+        log(f"firecrawl 调用异常: {type(e).__name__}: {str(e)[:120]} —— "
+            f"第 {_n} 次连续失败，冷却 {_dl}s"
+            f"（{FC_ESCALATE_BASE}s 起、连续失败递增至 {FC_ESCALATE_MAX}s）",
+            "FEED")
         return None
     out = (r.stdout or "").strip()
     _raw = out          # 未剥壳原文，供网关 5xx 识别（见下方 _FIRECRAWL_GW_RE）
@@ -2732,9 +2810,9 @@ def firecrawl_get(url, timeout=None):
                 f"本轮该接口的数据会缺失/不完整", "FEED")
             _fc_fail_set(time.time() + FIRECRAWL_RATE_LIMIT_COOLDOWN)
             return None
-        log(f"firecrawl 无输出 rc={r.returncode} "
-            f"stderr={_err[:120]!r}", "FEED")
-        _fc_fail_set(time.time() + FIRECRAWL_COOLDOWN)
+        _dl, _n = _fc_fail_bump()
+        log(f"firecrawl 无输出 rc={r.returncode} stderr={_err[:120]!r} —— "
+            f"第 {_n} 次连续失败，冷却 {_dl}s", "FEED")
         return None
     # ⚠️ CLI 会先打印一行 `Scrape ID: xxx`，必须剥掉，否则调用方的
     # json.loads / 正则解析全部失败 —— 而失败会被当成"兜底也拿不到"，
@@ -2765,6 +2843,10 @@ def firecrawl_get(url, timeout=None):
             "FEED")
         _fc_fail_set(time.time() + FIRECRAWL_GATEWAY_COOLDOWN)
         return None
+    # ⚠️ 成功一次 -> 连续失败计数清零（见 `_fc_ok`）。
+    # 没有这一步，递增冷却会变成"只要历史上连续失败过 8 次，
+    # 以后每次失败都直接罚满 900s" —— 惩罚永不衰减。
+    _fc_ok()
     return out or None
 
 
@@ -2776,18 +2858,21 @@ def firecrawl_json(url, timeout=None):
     try:
         d = json.loads(txt)
     except Exception:
-        log(f"firecrawl 返回非 JSON: {txt[:120]!r}", "FEED")
         # ⚠️ 解析失败同样要**武装冷却**。原先只记日志就 return，
         # 于是网关持续故障时每一轮、每一次调用都重新付一次
         # firecrawl 往返（实测 3.24s）。`[实测]` 2026-09-29：
         # 单日 18 次失败全部未武装冷却。
-        _fc_fail_set(time.time() + FIRECRAWL_COOLDOWN)
+        # ⚠️ 2026-11-24：改走**递增**冷却（同 firecrawl_get 的两处通用分支）。
+        _dl, _n = _fc_fail_bump()
+        log(f"firecrawl 返回非 JSON: {txt[:120]!r} —— "
+            f"第 {_n} 次连续失败，冷却 {_dl}s", "FEED")
         return None
     # ⚠️ 形状校验同 proxy_json：502 页正文是 `502`，json.loads 成功返回 int。
     # 不校验的话"错误页"会被当成"兜底成功"返回给调用方。
     if not isinstance(d, dict):
-        log(f"firecrawl 返回非对象 JSON（{type(d).__name__}）: {txt[:120]!r}", "FEED")
-        _fc_fail_set(time.time() + FIRECRAWL_COOLDOWN)
+        _dl, _n = _fc_fail_bump()
+        log(f"firecrawl 返回非对象 JSON（{type(d).__name__}）: {txt[:120]!r} —— "
+            f"第 {_n} 次连续失败，冷却 {_dl}s", "FEED")
         return None
     return d
 
