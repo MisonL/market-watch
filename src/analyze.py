@@ -4524,8 +4524,14 @@ def ai_analyze(brief, hits, plan, extra="", slot=None):
         · 「建议·机会」：贴近 20 日低 3706.30
       规则：
         · **数值只在「关键位」段出现**（那一段的职责就是给位置与距离）；
-        · 「触发」段只在**它真的触发了阈值**时才给数，没触发就一句
-          "本轮无阈值触发"即可，不要顺手把某个指数的距离当结论补上；
+        · 「触发」段只在**它真的触发了阈值**时才写。**没触发就整段不写** ——
+          把「· 无阈值触发」加到标题末尾即可（例：
+          `> **午后开局 · 科技链回补 · 无阈值触发**`）。
+          ⚠️ 不要在正文里留一个「**触发** 本轮无阈值触发」的段：那占掉
+          一整段却零信息，而且就在最显眼的位置 —— 读者要先读一句
+          "什么都没发生"才能读到盘面。`[实测]` 这类段在近 200 条推送里
+          占 **10%**，是纯噪声。
+          也不要顺手把某个指数的距离当结论补上；
         · 「建议」段只谈动作方向，**不再给点位**（写"恒科贴近 20 日低、
           需观察能否企稳"即可，不要重复 3706.30）。
 
@@ -6366,6 +6372,120 @@ def _norm_levels_line(t, q, slot, now):
     return "\n".join(_lines)
 
 
+# 「本轮没有任何阈值触发」的各种措辞（AI 与兜底模板都会写）。
+# ⚠️ 必须**穷举**实际出现过的形态，否则判据漏一种就等于没修。
+# 从 history/pushes.jsonl 近 200 条里捞出的真实写法：
+#   「本轮无阈值命中。」「本轮没有触发预设阈值；…」「本轮无阈值触发」
+_NOFIRE_RE = re.compile(
+    r"^(?:本轮)?\s*(?:无|没有)\s*"
+    r"(?:任何)?\s*(?:阈值|预设阈值|阈值规则)?\s*"
+    r"(?:触发|命中)")
+
+
+def _collapse_empty_trigger(t):
+    """把「**触发** 本轮无阈值触发」这种零信息段并进标题。
+
+    ## 为什么这是缺陷而不是风格
+
+    `[实测]` 最近 200 条推送里 **20 条**（10%）第三行是一整段
+    「**触发** 本轮无阈值命中。」。它占了一行段头 + 一行正文 + 两个
+    空行间隔，读完全程**得不到任何信息** —— 而「没有触发」这个事实
+    在标题里一个后缀就能说完。
+
+    更糟的是它在**最显眼的位置**（紧跟标题）。读者每次都要先读一句
+    "什么都没发生"，才能读到真正的盘面。
+
+    ## 为什么必须先看代码侧，而不是只改 prompt
+
+    prompt 里明令「没触发就一句『本轮无阈值触发』即可」—— 已经写了，
+    AI 照着做了，问题恰恰就是"照着做了"。这条规则本身在要求一个
+    零信息段，**改措辞治不好，必须改结构**。
+
+    所以：prompt 改成「没触发就**不写**触发段、把后缀加进标题」，
+    同时在**共同出口**做一次等效归一 —— 两条路径（AI / 兜底模板）
+    都会经过这里，且不依赖 AI 听话。
+
+    ## 判据
+
+    段头行 `**触发**`，且**整段正文**都是"没触发"的说法（按行拼起来
+    匹配 `_NOFIRE_RE`）。只要正文里有任何一条真实触发（「恒生科技
+    -1.53%」之类），一律不动 —— 那条段是有内容的。
+
+    ⚠️ 正文取"到下一个段头/空行分隔"为止：实际形态是段头与正文在
+    **同一行**（`**触发** 本轮无阈值命中。`），也见过正文续在下一行。
+    两种都要认，否则只修一半。
+    """
+    if not t or not isinstance(t, str):
+        return t
+    _lines = t.split("\n")
+    # 先定位标题行（跳过前置空行，同 _norm_title）
+    _ti = 0
+    while _ti < len(_lines) and not _lines[_ti].strip():
+        _ti += 1
+    if _ti >= len(_lines):
+        return t
+    _tm = _TITLE_RE.match(_lines[_ti])
+    if not _tm:
+        return t          # 没有标题 -> 不猜，原样返回
+
+    _out = list(_lines)
+    _fire_i = -1
+    for _i, _ln in enumerate(_out):
+        _st = _ln.strip()
+        if not _st.startswith("**触发**"):
+            continue
+        _body = _st[len("**触发**"):].strip()
+        # 正文可能续在下一行（到空行或下一个段头为止）
+        _j = _i + 1
+        _cont = []
+        while _j < len(_out):
+            _nxt = _out[_j].strip()
+            if not _nxt or _nxt.startswith("**") or _nxt.startswith(">"):
+                break
+            _cont.append(_nxt)
+            _j += 1
+        _full = (_body + " " + " ".join(_cont)).strip()
+        if not _full:
+            # 空正文：也是零信息，一并并掉（与 _trg_txt 的取舍一致）
+            _fire_i = _i
+            break
+        if _NOFIRE_RE.match(_full):
+            _fire_i = _i
+            break
+        return t          # 有真实触发 -> 不动
+    if _fire_i < 0:
+        return t
+
+    # 删掉该段（含它的续行）及其后紧跟的一个 § 间隔行
+    _del_to = _fire_i + 1
+    while _del_to < len(_out):
+        _nxt = _out[_del_to].strip()
+        if not _nxt or _nxt.startswith("**") or _nxt.startswith(">"):
+            break
+        _del_to += 1
+    # ⚠️ 段**前**那个间隔行（标题与「**触发**」之间的 SPACER/空行）
+    # 也要去掉 —— 只删段本身会留下两个连续间隔行：
+    #     **盘面** …          <- 中间夹着 `　` `　` 两行
+    # `[实测]` 第一版就是这个形态，肉眼看是"标题下多了一段空白"。
+    while (_fire_i > _ti + 1 and not _out[_fire_i - 1].strip()):
+        _fire_i -= 1
+    # 段后那个空行/全角间隔也一起去掉
+    if _del_to < len(_out) and not _out[_del_to].strip():
+        _del_to += 1
+    del _out[_fire_i:_del_to]
+
+    # 标题加后缀（保留 AI 的后半句判断）
+    _tm = _TITLE_RE.match(_out[_ti]) if _ti < len(_out) else None
+    if _tm:
+        _inner = _tm.group(2)
+        _SUF = " · 无阈值触发"
+        if not _inner.endswith(_SUF) and "无阈值触发" not in _inner:
+            _out[_ti] = _tm.group(1) + _inner + _SUF + _tm.group(3)
+    _res = "\n".join(_out)
+    _log("「无阈值触发」段已并入标题（零信息段不再单独占位）")
+    return _res
+
+
 def _norm_title(t, slot):
     """把标题首行的时段名纠正为 slot 对应的 role。
 
@@ -7532,8 +7652,11 @@ def _fallback_text(q, hits, slot, now, hot=None):
     # 最早也只能在 09:25 认领（hits 已有内容），这条路径**不可达**。
     # 它与 _ov_txt 的「数据本轮不可用」是同一原则：宁可显式说明，
     # 不要留一个空标题。
-    _trg_txt = ('；'.join(h2[1] for h2 in hits) if hits
-                else "本轮无阈值触发")
+    # ⚠️⚠️ 2026-11-24：**hits 为空时不再渲染「**触发**」段**。
+    # 与 AI 路径同口径（那边由 prompt 要求 + `_collapse_empty_trigger`
+    # 在共同出口兜底）。让兜底模板继续写零信息段，等于"代码自己没做到
+    # 它要求 AI 做到的事" —— 本仓库反复栽在这个形态上。
+    _trg_txt = ('；'.join(h2[1] for h2 in hits) if hits else "")
     # ⚠️ 涨跌榜段在**兜底路径也要有**（2026-10-12）：AI 一超时，读者不能
     # 就少掉"今日涨得最多/跌得最多的三个板块"这一段 —— 模板路径与 AI 路径
     # 必须口径一致（同 [[market-watch-fallback-path-parity]] 的教训：
@@ -7670,9 +7793,13 @@ def _fallback_text(q, hits, slot, now, hot=None):
                     break
             if _t0:
                 _judge_t = (_t0 if len(_t0) <= 30 else _t0[:30] + "…")
+    # ⚠️ 触发段按 `_trg_txt` 是否为空**整段省略**（2026-11-24）。
+    # 后缀加在标题里，与 AI 路径和 `_collapse_empty_trigger` 三方同口径。
+    _trg_sec = f"**触发** {_trg_txt}\n\n" if _trg_txt else ""
+    _judge_t = (f"{_judge_t} · 无阈值触发") if not _trg_txt else _judge_t
     txt = (f"> **市场盯盘 · {_judge_t}**\n\n"
            f"{_ov_txt}"
-           f"**触发** {_trg_txt}\n\n"
+           f"{_trg_sec}"
            f"{_pans}\n\n"
            f"{_hot_txt}"
            f"{_start_txt}"
@@ -7956,6 +8083,11 @@ def produce_text(brief, hits, plan, slot, q, now, hot=None):
     # 格式规范化放在 _spacers 之前：_spacers 处理的是空行/引用块，
     # 与这些格式无关，但先规范化能让 _spacers 看到最终文本。
     txt = _norm_title(txt, slot)
+    # ⚠️ 必须排在 `_norm_title` **之后**：这里要往标题上写后缀，
+    # 而 `_norm_title` 会整段重写标题（保留后半句判断），放在它前面
+    # 后缀会被冲掉。也要排在 `_norm_sectors` 之前，让后面所有按行
+    # 定位的处理看到的是**已删掉该段**的干净结构。
+    txt = _collapse_empty_trigger(txt)
     txt = _norm_sectors(txt)
     # 盘面行补齐放在 _spacers 之前：它按**行**操作，行结构越早稳定越好；
     # 与 _norm_sectors 同层（都是"格式完全确定 → 代码层做到 100%"）。
