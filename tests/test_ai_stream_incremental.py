@@ -165,28 +165,79 @@ check(_s.kind == _first_kind == "text",
 check(_s.feed(_line("text_delta", "更多正文")) is False,
       "判定 text 之后再喂数据应返回 False（已停止扫描）")
 
-# ---------- ⑨【核心】性能必须近似线性，不能 O(N²) ----------
-# 用思考密集流（不早退，与生产形态一致）。判定标准：
-#   · 2 倍数据量的耗时不得超过 3 倍（O(N²) 会是 4 倍）
-#   · 且绝对耗时必须在秒级以内
-def _feed_mb(mb):
-    _sc = M._StreamScanner()
-    _chunk = b"".join(_line("thinking_delta", "y" * 300, key="thinking")
-                      for _ in range(4))          # ~1.5KB
+# ---------- ⑨【核心】性能：必须比"每块重扫全量"快一个量级 ----------
+#
+# ⚠️⚠️ 这一段的判据改过两次，记下来免得再走回头路。
+#
+# 第一版写的是**绝对耗时** + 线性比值：
+#       check(_t2 < max(_t1 * 3.0, 0.02), ...)
+# 本地一次全绿，CI（Python 3.13）却红了 —— 日志：
+#       1MB=0.005s, 2MB=0.021s
+# 比值 4.2 倍"看起来像 O(N²)"，其实**这个量级下测的是 GC 与分配抖动，
+# 不是算法复杂度**：几十毫秒的测量里，一次垃圾回收就能让比值翻倍。
+# 而绝对阈值（0.02s）刚好卡在噪声里 —— 那是一个会随机变红的断言，
+# 比没有还糟：真退化时它可能照样绿，平时却天天误报。
+#
+# 现在换成**两条都不依赖机器速度**的判据：
+#   ① 与**模拟的旧实现**比：同一份数据，增量版必须快 5 倍以上。
+#      旧实现的代价正是"每块重拼全缓冲再全量扫"，这里如实模拟它。
+#   ② 线性：4MB 的耗时不得超过 1MB 的 8 倍（真 O(N²) 会是 16 倍）。
+#      比值判据本身仍受噪声影响，所以取**多轮最小值**压抖动，
+#      并把阈值放宽到 8 倍（留足 GC 余量，仍能把 16 倍挡在外面）。
+def _chunk_of(n_lines=4):
+    return b"".join(_line("thinking_delta", "y" * 300, key="thinking")
+                    for _ in range(n_lines))        # ~1.5KB
+
+
+def _feed_incremental(mb, rounds=3):
+    """增量扫描：只扫新块。取多轮**最小值**（压制 GC 抖动）。"""
+    _chunk = _chunk_of()
     _n = int(mb * 1024 * 1024) // len(_chunk)
-    _t0 = time.monotonic()
-    for _ in range(_n):
-        _sc.feed(_chunk)
-    return time.monotonic() - _t0
+    _best = None
+    for _ in range(rounds):
+        _sc = M._StreamScanner()
+        _t0 = time.monotonic()
+        for _ in range(_n):
+            _sc.feed(_chunk)
+        _dt = time.monotonic() - _t0
+        _best = _dt if _best is None else min(_best, _dt)
+    return _best
 
 
-_t1 = _feed_mb(1.0)
-_t2 = _feed_mb(2.0)
-check(_t2 < max(_t1 * 3.0, 0.02),
-      f"扫描耗时随数据量超线性增长（1MB={_t1:.3f}s, 2MB={_t2:.3f}s）"
-      f" —— 增量扫描退回到了 O(N²) 全量重扫")
-check(_t2 < 2.0,
-      f"2MB 事件流解析耗时 {_t2:.2f}s 过慢 —— 生产 12.4MB 的流会烧掉分钟级 CPU")
+def _feed_quadratic(mb, rounds=3):
+    """**如实模拟旧实现**：每收一块就重拼已累积的全缓冲、从头全量扫。
+
+    这就是 2026-11-24 之前 pump 线程里那两行：
+        _all = b"".join(bufs[1])
+        _kind = _ai_stream_kind(_all)
+    """
+    _chunk = _chunk_of()
+    _n = int(mb * 1024 * 1024) // len(_chunk)
+    _best = None
+    for _ in range(rounds):
+        _bufs = []
+        _t0 = time.monotonic()
+        for _ in range(_n):
+            _bufs.append(_chunk)
+            M._ai_stream_kind(b"".join(_bufs))
+        _dt = time.monotonic() - _t0
+        _best = _dt if _best is None else min(_best, _dt)
+    return _best
+
+
+_inc = _feed_incremental(1.0)
+_quad = _feed_quadratic(1.0)
+check(_inc * 5 < _quad,
+      f"增量扫描没有比旧的全量重扫快 5 倍（增量 {_inc:.4f}s vs "
+      f"全量重扫 {_quad:.4f}s）—— `feed()` 里八成又退回了重扫全缓冲")
+
+_t1 = _feed_incremental(1.0)
+_t4 = _feed_incremental(4.0)
+check(_t4 < max(_t1 * 8.0, 0.05),
+      f"扫描耗时随数据量超线性增长（1MB={_t1:.4f}s, 4MB={_t4:.4f}s，"
+      f"比值 {_t4 / max(_t1, 1e-9):.1f}）—— 真 O(N²) 会是 16 倍")
+check(_t4 < 2.0,
+      f"4MB 事件流解析耗时 {_t4:.2f}s 过慢 —— 生产 12.4MB 的流会烧掉分钟级 CPU")
 
 # ---------- ⑩接线断言：pump 必须真的用增量版 ----------
 _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
