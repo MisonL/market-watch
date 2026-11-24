@@ -2499,6 +2499,73 @@ FIRECRAWL_COOLDOWN = 900        # 冷却 15 分钟；期间不再尝试
 # 分档后：限流 -> 60s 后重试；其余失败 -> 仍是 900s。
 FIRECRAWL_RATE_LIMIT_COOLDOWN = 60
 
+# ⚠️⚠️ 2026-11-24（P1，实测）：firecrawl **没有节流**，一轮扫描必然打爆额度。
+#
+# 额度上限是 12 req/min —— `[实测]` 限流原文就写着：
+#     Consumed (req/min): 11, Remaining (req/min): 0
+# 而一轮完整扫描要几次请求？
+#     行业 m:90+t:2  496 个 / pz=100 硬上限 = 5 页
+#     概念 m:90+t:3  554 个 / 100           = 6 页
+#     clist_extremes 两方向各 ≤2 页          = ≤8 页
+# 合计 **11~19 次**。这些请求是**背靠背**发出的 —— `firecrawl_get` 里
+# 一次 `time.sleep` 都没有（grep 确认 0 处）。于是：
+#   请求 1..11 在几秒内打完 -> 第 12 次撞上限 -> 套 60s 限流冷却
+#   -> 本轮剩下的分页**全部**在 0.0s 内空回
+#
+# `[实测]` 2026-11-24：全天 22 次限流、84 个 clist 分页被直接放弃，
+# 板块列表长期停在 **200/496**（只取到前 2 页）。
+# 按 f62 降序时，**缺的正是排在最后的那些** —— 也就是流出最猛的板块。
+#
+# 根因不是"总量太大"（300s 一轮 vs 12 req/min，总量绰绰有余），
+# 而是**瞬间太密**。所以修法是**打散**，不是砍页数：
+# 跨进程保证两次 firecrawl 调用间隔 ≥ FIRECRAWL_MIN_INTERVAL。
+#
+# 5.5s 的取舍：
+#   · 60/5.5 ≈ 10.9 req/min，压在上限 12 之下，留出重试余量；
+#   · 11 次全走兜底时最坏 60s，仍在 DATA_BUDGET=120s 之内；
+#   · 只对**真的走 firecrawl**的调用计费 —— 直连成功的那些不占额度，
+#     一次都不用等（常见情形下直连能拿大部分页）。
+FIRECRAWL_MIN_INTERVAL = 5.5
+_FC_PACE_FILE = p_state("firecrawl_pace.json")
+_fc_pace_local = [0.0]      # 锁不可用时的进程内降级时间戳
+
+
+def _fc_pace():
+    """跨进程保证两次 firecrawl 调用间隔 ≥ FIRECRAWL_MIN_INTERVAL。
+
+    与 `RateLimiter._throttle_cross` 同款做法（锁内读-改-写共享时间戳）——
+    生产里 `marketwatch` 与 `marketcollect` 是两条独立进程，各记各的
+    等于没节流。
+
+    降级策略：锁/文件不可用时退回**进程内**时间戳，而不是"不节流"。
+    宁可慢一点，也不要打爆额度 —— 打爆的代价是整个上午没有板块数据，
+    而慢的代价只是这一轮多花几十秒（且 `clist` 的 `budget_s` 会兜住）。
+    """
+    try:
+        with _open_lockfile(_FC_PACE_FILE + ".lock") as _lk:
+            try:
+                fcntl.flock(_lk, fcntl.LOCK_EX)
+            except Exception:
+                pass
+            _d = _load_json(_FC_PACE_FILE, {}) or {}
+            _last = _d.get("ts")
+            _last = float(_last) if isnum(_last) else 0.0
+            _w = time.time()
+            if _w - _last < FIRECRAWL_MIN_INTERVAL:
+                time.sleep(FIRECRAWL_MIN_INTERVAL - (_w - _last))
+                _w = time.time()
+            try:
+                _atomic_write_json(_FC_PACE_FILE, {"ts": _w})
+            except Exception:
+                pass
+    except Exception:
+        _w = time.time()
+        _gap = _w - _fc_pace_local[0]
+        if _gap < FIRECRAWL_MIN_INTERVAL:
+            time.sleep(FIRECRAWL_MIN_INTERVAL - _gap)
+    _fc_pace_local[0] = time.time()
+
+
 # ⚠️⚠️ 2026-11-24（P1，实测）：**网关 5xx 也不是源故障，不该按 900s 冷却**。
 #
 # 与上面"限流不是故障"是同一类错误的第二个入口。`[实测]` 今日 09:35 起，
@@ -2572,6 +2639,9 @@ def firecrawl_get(url, timeout=None):
     if not (os.path.exists(_FIRECRAWL_NODE) and os.path.exists(_FIRECRAWL_CLI)):
         return None
     _to = timeout or FIRECRAWL_TIMEOUT
+    # ⚠️ 节流放在**真的要用 firecrawl 时**才付：上面的冷却与可用性闸门
+    # 已提前返回，不会白等。见 `FIRECRAWL_MIN_INTERVAL` 的账。
+    _fc_pace()
     try:
         r = subprocess.run(
             # ⚠️⚠️ 2026-11-23（P0，数据正确性）：**必须 `--max-age 0` 禁掉云端缓存**。
