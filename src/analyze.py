@@ -6477,7 +6477,12 @@ def _norm_levels_line(t, q, slot, now):
 # 注释（见 `_judge_t` 的赋值处，2026-10-30 修）—— 但那修的是标题，
 # 触发段本身照样渲染。**判据写在一处、漏在另一处**，与本仓库反复修的
 # 「同一份口径两处维护」同型。
-_SLOT_LABEL_RE = re.compile(r"^整点播报\s*\d{1,2}:\d{2}$")
+# ⚠️ 冒号必须**两种都认**（2026-11-24）。我们自己生成的是半角
+# （`f"整点播报 {hourly}"`，hourly 来自 SLOTS 的键），但 `_collapse_empty_trigger`
+# 处理的是 **AI 输出** —— 模型把内部标记抄进正文时，中文语境下很自然写成
+# 全角「15：00」。只认半角时那种行会漏网，触发段照样渲染。
+# `[实测]` 全角形态原先 `_is_slot_label` 返回 False（漏网）。
+_SLOT_LABEL_RE = re.compile(r"^整点播报\s*\d{1,2}[:：]\d{2}$")
 
 
 def _is_slot_label(seg):
