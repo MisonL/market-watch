@@ -2520,27 +2520,50 @@ FIRECRAWL_RATE_LIMIT_COOLDOWN = 60
 # 而是**瞬间太密**。所以修法是**打散**，不是砍页数：
 # 跨进程保证两次 firecrawl 调用间隔 ≥ FIRECRAWL_MIN_INTERVAL。
 #
-# 5.5s 的取舍：
-#   · 60/5.5 ≈ 10.9 req/min，压在上限 12 之下，留出重试余量；
-#   · 11 次全走兜底时最坏 60s，仍在 DATA_BUDGET=120s 之内；
-#   · 只对**真的走 firecrawl**的调用计费 —— 直连成功的那些不占额度，
-#     一次都不用等（常见情形下直连能拿大部分页）。
-FIRECRAWL_MIN_INTERVAL = 5.5
+# ⚠️⚠️ 2026-11-24 第二次修（第一版**不够**，实测仍在限流）：
+#
+# 第一版用的是**固定间隔 5.5s = 10.9 req/min**。而限流原文写的是
+#     Consumed (req/min): 11, Remaining (req/min): 0
+# 即上限就是 **11/min** —— 我给自己留的余量是 **0.1 次**，等于没有。
+# `[实测]` 上线后 12:58 仍然限流，板块列表照旧停在 200/496。
+#
+# 而且固定间隔还有第二个毛病：它**浪费额度**。一轮最坏要 19 页
+# （hot 5+6、alert 两个 fs 各两方向各 2 页），19 × 5.5 = 105s，
+# 几乎撑满 DATA_BUDGET=120s，重试一次就超。
+#
+# 正确的做法是**滑动窗口配额**，不是固定间隔：
+#   · 只看最近 60s 内发过几次，没到上限就**立刻放行**（不人为拖慢）
+#   · 到了上限就排到"最早那次滑出窗口"的时刻
+# 这样既能用满额度、又绝不超过，且天然容忍突发。
+#
+# 上限取 9/min（比 11 低 18%），余量留给三件事：
+#   ① `feeds.py` 里那条**独立**的 firecrawl_get 调用点（不经 clist）
+#   ② clist 的失败重试（重试本身就是额外请求）
+#   ③ 两个进程的时钟/调度抖动
+FC_WINDOW = 60.0          # 窗口时长（秒）
+FC_MAX_PER_WINDOW = 9     # 窗口内最多发几次（上限 11，留 18% 余量）
 _FC_PACE_FILE = p_state("firecrawl_pace.json")
-_fc_pace_local = [0.0]      # 锁不可用时的进程内降级时间戳
+_fc_pace_local = [[]]     # 锁不可用时的进程内降级：[(时刻)]
 
 
 def _fc_pace():
-    """跨进程保证两次 firecrawl 调用间隔 ≥ FIRECRAWL_MIN_INTERVAL。
+    """跨进程**滑动窗口**配额：60s 内最多 FC_MAX_PER_WINDOW 次 firecrawl 调用。
 
-    与 `RateLimiter._throttle_cross` 同款做法（锁内读-改-写共享时间戳）——
-    生产里 `marketwatch` 与 `marketcollect` 是两条独立进程，各记各的
-    等于没节流。
+    与固定间隔的区别（这是本次修的核心）：固定间隔为了不超限，必须按
+    "最坏密度"拖慢**每一次**调用；滑动窗口只在**真的用满**时才等，
+    平时立即放行。同样守住上限，吞吐高得多。
 
-    降级策略：锁/文件不可用时退回**进程内**时间戳，而不是"不节流"。
-    宁可慢一点，也不要打爆额度 —— 打爆的代价是整个上午没有板块数据，
-    而慢的代价只是这一轮多花几十秒（且 `clist` 的 `budget_s` 会兜住）。
+    ⚠️ 实现用"**排票**"而不是"持锁睡觉"：
+    锁内算出本次该在什么时刻发、把那个时刻**写进窗口列表**，然后**释放锁**
+    再去睡。这样多进程各自拿到不同的未来时刻，谁也不会把别人堵在锁上
+    （持锁睡觉时，一次 60s 的等待会让另一个进程也阻塞 60s —— 而它明明
+    可以去做别的事）。
+
+    降级：锁/文件不可用时退回**进程内**窗口，而不是"不节流"。
+    宁可慢，也不要打爆额度 —— 打爆的代价是整个上午没有板块数据。
     """
+    _now = time.time()
+    _wait_until = _now
     try:
         with _open_lockfile(_FC_PACE_FILE + ".lock") as _lk:
             try:
@@ -2548,22 +2571,35 @@ def _fc_pace():
             except Exception:
                 pass
             _d = _load_json(_FC_PACE_FILE, {}) or {}
-            _last = _d.get("ts")
-            _last = float(_last) if isnum(_last) else 0.0
-            _w = time.time()
-            if _w - _last < FIRECRAWL_MIN_INTERVAL:
-                time.sleep(FIRECRAWL_MIN_INTERVAL - (_w - _last))
-                _w = time.time()
+            _ts = _d.get("ts")
+            # 兼容第一版的格式 `{"ts": <float>}`（部署升级瞬间可能读到）
+            if isnum(_ts):
+                _ts = [float(_ts)]
+            elif not isinstance(_ts, list):
+                _ts = []
+            _ts = [float(x) for x in _ts if isnum(x)]
+            _ts = [x for x in _ts if x > _now - FC_WINDOW]     # 滑出窗口的丢掉
+            if len(_ts) >= FC_MAX_PER_WINDOW:
+                # 排到"最早那次滑出窗口"的时刻
+                _wait_until = _ts[0] + FC_WINDOW
+                _ts = _ts[1:] + [_wait_until]
+            else:
+                _ts.append(_now)
             try:
-                _atomic_write_json(_FC_PACE_FILE, {"ts": _w})
+                _atomic_write_json(_FC_PACE_FILE, {"ts": _ts})
             except Exception:
                 pass
     except Exception:
-        _w = time.time()
-        _gap = _w - _fc_pace_local[0]
-        if _gap < FIRECRAWL_MIN_INTERVAL:
-            time.sleep(FIRECRAWL_MIN_INTERVAL - _gap)
-    _fc_pace_local[0] = time.time()
+        # 锁不可用：进程内窗口（与上面同一算法，只是不跨进程）
+        _ts = [x for x in _fc_pace_local[0] if x > _now - FC_WINDOW]
+        if len(_ts) >= FC_MAX_PER_WINDOW:
+            _wait_until = _ts[0] + FC_WINDOW
+            _ts = _ts[1:] + [_wait_until]
+        else:
+            _ts.append(_now)
+        _fc_pace_local[0] = _ts
+    if _wait_until > _now:
+        time.sleep(_wait_until - _now)
 
 
 # ⚠️⚠️ 2026-11-24（P1，实测）：**网关 5xx 也不是源故障，不该按 900s 冷却**。
