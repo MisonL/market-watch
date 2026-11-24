@@ -87,7 +87,12 @@ def fetch_sectors():
         # 也按 100 算）—— 那时 3 页只能拿到 300 个板块，**静默少 40%**。
         # 提到 8 覆盖 100×8=800 > 516。**代价为零**：clist 现在按服务端
         # `total` 判终止，正常路径第 2 页就 break，不会真的发 8 次请求。
-        got=_clist(fs, F, pz=500, max_pn=8, budget_s=60)
+        # ⚠️ 2026-11-24（P1）：改走 `M.sector_rows()` —— 与 `alert._sector_rows`
+        # **共用同一份全量名单**。原先两处各拉一遍同一批板块，
+        # 一轮 19 次请求而 firecrawl 额度只有 11/min、DATA_BUDGET 120s，
+        # 19 次需要 127s —— 算术上就不可能取全。
+        # 见 `marketlib.sector_rows` 上方的账。
+        got, _tot, _complete = M.sector_rows(fs, budget_s=60, max_pn=8)
         for x in got:
             # ⚠️ 必须判 dict。clist() 会把 diff 里的元素**原样透传**，而
             # diff 的形状由上游决定（可能是 list 含字符串/None），

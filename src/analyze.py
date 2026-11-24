@@ -5502,6 +5502,16 @@ def run(now, force, dry, hm, _t0=None):
                              else time.time()) + M.DATA_BUDGET)
     except Exception:
         pass
+    # ⚠️⚠️ 2026-11-24（P1）：**每轮开头必须清板块名单缓存**。
+    # `M.sector_rows()` 在轮内只拉一次（hot 与 alert 共用），但它按 `fs`
+    # 缓存 —— 不清的话本轮会读到**上一轮**的名单，而那正是本仓库最忌讳的
+    # 「拿几分钟前那份当真值」（见 firecrawl `--max-age 0` 的取舍）。
+    # 放在 `set_data_deadline` 之后、任何取数之前：两者都在本轮起点，
+    # 但缓存清理**不消耗预算**，顺序上无所谓；放这里有明确语义边界。
+    try:
+        M.sector_round_reset()
+    except Exception as _e:
+        _log(f"清板块轮内缓存失败: {type(_e).__name__}: {_e}")
     st=load_st()
     ids = index_secids() + watch_secids() + hk_secids()
     # 先试复用 collect 刚写的快照（两者取的标的集合完全相同，见

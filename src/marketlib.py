@@ -5448,6 +5448,71 @@ def clist(fs, fields, pz=100, max_pn=12, fid="f3", po=1, budget_s=None,
     # `hot.members()` 于是把残缺名单当完整缓存 7 天。
     return (out, _total) if with_total else out
 
+# ⚠️⚠️ 2026-11-24（P1，实测）：同一轮里板块名单被**拉了两遍**，
+# 而一遍就已经超预算。
+#
+# 一轮 analyze 里有两个消费者，各拉一遍同一个板块宇宙：
+#     hot.fetch_sectors()      行业 5 页 + 概念 6 页 = 11 次
+#     alert._sector_rows()     两方向各 ≤2 页 × 2 类 = ≤8 次
+#                              合计 19 次
+# 而 firecrawl 额度 11/min、DATA_BUDGET 120s，按 9 req/min 算
+# **19 次要 127 秒** —— 比预算还长。所以无论怎么调冷却/节流，
+# 「取全」在这套预算下**算术上就不可能**。
+#
+# `[实测]` 13:47 那一轮：t:2 与 t:3 各停在 **200/496、199/554**
+# （每类只取到 2 页），四个消费者日志一模一样地报「名单不完整」。
+#
+# 修法不是砍页数（砍了就永久丢掉"流出最猛那批"），而是**只拉一遍**：
+# 两边共用同一份全量名单，请求数 19 -> 11（5+6），
+# 11 × 6.7s ≈ 74s，回到预算之内。
+#
+# 为什么用全量而不是让 hot 复用 alert 的 extremes：alert 用
+# `po=1/po=0` 两端各取 ≤2 页（8 次），比全量（11 次）省 3 次，
+# 但 hot 需要**全量**做候选池（按成交额/成分股数过滤）。
+# 让 alert 也读全量，总请求 11；让 hot 只读 extremes，hot 就废了。
+# 所以共享的是**全量那份**。
+#
+# 字段取**超集**（hot 的 18 个字段包含 alert 需要的 f12/f14/f3/f6/f62/f184），
+# 否则两份 URL 不同、缓存命中不了 —— 那正是"共享"最容易假生效的地方。
+SECTOR_FIELDS = ("f2,f3,f6,f8,f10,f12,f14,f20,f21,f24,f62,f66,f69,"
+                 "f104,f105,f128,f134,f184")
+
+# 轮内缓存：`{fs: (rows, total, complete)}`。
+# ⚠️ 必须由调用方在**每轮开头**显式 `sector_round_reset()`。
+# 不能按时钟分桶（例如 `now//300`）—— 那样跨轮会复用上一轮的数据，
+# 而本仓库最忌讳的就是"拿几分钟前那份当真值"（见 `--max-age 0` 的注释）。
+_SECTOR_CACHE = {}
+
+
+def sector_round_reset():
+    """清空轮内板块名单缓存。**每轮 analyze 开头必须调一次**。"""
+    _SECTOR_CACHE.clear()
+
+
+def sector_rows(fs, budget_s=45, max_pn=8):
+    """取一类板块的**全量**名单（同轮内只拉一次，hot 与 alert 共用）。
+
+    返回 `(rows, total, complete)`：
+      · `rows`     —— 已取到的行（可能不完整）
+      · `total`    —— 服务端声明总数（None = 未声明）
+      · `complete` —— 是否确认取全
+
+    ⚠️ 只缓存**成功**的结果（`rows` 非空）。失败也缓存的话，本轮后续
+    调用会拿到空名单并当成"真没有板块" —— 那是静默漏报。
+    """
+    _hit = _SECTOR_CACHE.get(fs)
+    if _hit is not None:
+        return _hit
+    rows, total = clist(fs, SECTOR_FIELDS, pz=500, max_pn=max_pn,
+                        fid="f62", po=1, budget_s=budget_s, with_total=True)
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    complete = bool(rows) and (total is not None and len(rows) >= total)
+    rec = (rows, total, complete)
+    if rows:
+        _SECTOR_CACHE[fs] = rec
+    return rec
+
+
 def clist_extremes(fs, fields, fabs, pz=100, pages=2, budget_s=None):
     """只取**资金两端**（流入榜头 + 流出榜头），供异动判定用。
 

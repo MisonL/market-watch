@@ -657,11 +657,27 @@ def _sector_rows(fs):
     # 覆盖率与全量扫描等价（末尾一旦低于门槛就停，后面的必然更小）。
     # `complete=False` 表示「无法确认取全」，此时照旧返回已取部分，
     # 但调用方要知道本轮结论不是「没有异动」而是「没看全」。
-    _thr = M.threshold("fund_abs", 50) * 1e8
-    rows, _complete = M.clist_extremes(
-        fs, "f12,f14,f3,f6,f62,f184", _thr, pz=100, pages=2, budget_s=45)
+    # ⚠️⚠️ 2026-11-24（P1）：改走**全量共享名单**，不再单独打两端。
+    #
+    # 原先这里是 `clist_extremes(...)`（两方向各 ≤2 页 = ≤4 次/类），
+    # 而 `hot.fetch_sectors()` 另拉一遍全量（5+6 次）—— 一轮合计 19 次。
+    # firecrawl 额度 11/min、`DATA_BUDGET` 120s，按 9 req/min 算 19 次要
+    # **127 秒**：算术上就不可能取全。`[实测]` 13:47 那一轮 t:2 与 t:3
+    # 各停在 200/496、199/554，四个消费者日志一模一样地报"名单不完整"。
+    #
+    # 现在两边共用 `M.sector_rows(fs)`：请求数 19 -> 11，
+    # 11 × 6.7s ≈ 74s，回到预算之内。
+    #
+    # 为什么不是反过来（让 hot 复用 extremes）：hot 需要**全量**做候选池
+    # （按成交额/成分股数过滤），只看两端会丢掉中间那一大段。
+    # 所以共享的一定是**全量那份**。
+    #
+    # 判据不变：`complete=False` 时照旧返回已取部分，并明确标注
+    # "本轮结论不是没有异动、而是没看全"。
+    rows, _total, _complete = M.sector_rows(fs, budget_s=45, max_pn=8)
     if not _complete:
-        _log(f"板块资金扫描({fs}) 未能确认取全（资金两端未收敛）—— "
+        _log(f"板块资金扫描({fs}) 未能确认取全"
+             f"（已取 {len(rows)}/{_total if _total else '?'}）—— "
              f"本轮若报无异动，只代表已取的 {len(rows)} 个板块里没有",
              "ALERT")
     return rows
