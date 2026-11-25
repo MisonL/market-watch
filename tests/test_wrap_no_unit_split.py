@@ -171,8 +171,19 @@ _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "..", "src", "analyze.py"), encoding="utf-8").read()
 check("_NOWRAP_HEAD" in _src,
       "缺少 `_NOWRAP_HEAD` 常量 —— 行首禁用字符集不见了")
-check('_p.rfind(" ",' in _src,
-      "硬切没有优先退到最近的空格 —— 可读性会明显变差"
+# ⚠️ 2026-11-25：硬切判据整体收进了 `_safe_split_cut()`，原先那句
+# `_p.rfind(" ", …)` 已不存在 —— 但"优先退到空格"这个**语义**必须还在，
+# 否则可读性会明显变差（本系统的空格正是天然词边界）。
+# 所以判据从"源码里有没有那行字"改成**行为级**：造一个必须硬切的串，
+# 断言切点确实落在空格上。静态那一条改成查 `_SPLIT_SEP` 里含空格。
+check("_safe_split_cut(" in _src,
+      "硬切没有走 `_safe_split_cut()` —— 数字/词边界守卫被绕过了")
+check("_SPLIT_SEP = set(" in _src and '" \\u3000' in _src,
+      "`_SPLIT_SEP` 不含空格 —— 硬切不再优先落在词边界上"
       "（本系统的空格正是天然词边界）")
+_cut_case = "**资金** " + "甲" * 30 + " 1234.5 亿，" + "乙" * 60
+_rows4 = A._split_wall_lines(_cut_case).split("\n")
+check(all(not (len(r) < 40 and r.strip()[:1].isdigit()) for r in _rows4[1:]),
+      f"硬切后仍有一行以数字开头：{[r for r in _rows4[1:] if r.strip()[:1].isdigit()]!r}")
 
 print(f"ALL PASS (硬切不劈开数字与单位 {_ok} 个断言)")
