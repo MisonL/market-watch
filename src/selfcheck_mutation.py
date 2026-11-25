@@ -457,8 +457,16 @@ MUTANTS = [
     # stdin=DEVNULL）复现，stdout 以 `' thinking'` 开头。
     ("think-strip-off",
      "analyze.py",
+     # ⚠️ 2026-11-25 锚点同步：`_strip_think` 新增第三道剥除
+     # （孤儿闭合标签 `_THINK_CLOSE_RE`，修 11-19/11-25 两条真实进群的
+     # 推理块泄漏）。注入体必须整段替换 —— 只改前两行的话第三道还在跑，
+     # 「不再剥推理块」这个语义不成立，测不出泄漏。
      '    t = _THINK_RE.sub("", t)\n'
      '    t = _THINK_OPEN_RE.sub("", t)\n'
+     '    # ⚠️ 顺序：先吃掉成对块与"未闭合的开标签到结尾"，再剥任何残留的\n'
+     '    # 闭合标签 —— 反过来会把 `</think>` 先删掉，让原本成对的块失去配对的\n'
+     '    # 闭合端，`_THINK_RE` 就匹配不上、整段推理留在正文里。\n'
+     '    t = _THINK_CLOSE_RE.sub("", t)\n'
      '    return t.strip()',
      '    return t  # 注入：不再剥推理块',
      "推理块不再剥除 → [AI 通道] 应报推理块处理错误",

@@ -3563,11 +3563,33 @@ def _today_push_digest(slot=None):
 # `_strip_meta` 漏词是同一个泄漏面）。多认标签的代价是零（正文里不会
 # 无故出现这些标签），漏认的代价是一整段思维链进群。
 # 保留 `thinking` 因为它就是 `think` 的过去式变体，两者都在正则里。
+# ⚠️ 开标签的 `>` 也写成可选（`\s*>?`）：模型把标签和正文粘连时
+# （`<thinking关键位段…`）同样要能配对到 `</think>`，否则会落到下面
+# `_THINK_OPEN_RE` 的"吃到结尾"分支 —— 那条分支会**连带删掉成对块之后的
+# 正文**（实测：`<think\n推理\n</think>正文` 被剥成空串，正文丢了）。
 _THINK_RE = re.compile(
-    r"<(?:think(?:ing)?|reasoning|analysis)\s*>.*?</(?:think(?:ing)?|reasoning|analysis)\s*>",
+    r"<(?:think(?:ing)?|reasoning|analysis)\s*>?.*?"
+    r"</(?:think(?:ing)?|reasoning|analysis)\s*>",
     re.S | re.I)
+# ⚠️⚠️ 2026-11-25（P1，真实进群）：开标签**可能没有 `>`**。
+# `[实测]` 当天 16:55「调研 Agent」那条推送第一行就是
+#     `<thinking关键位段已同步为「上方 4243.65，下方 3367.15」…`
+# ——模型把标签和正文粘在一起，`\s*>` 要求那个 `>` 存在，于是**整段思维链
+# 原样进了群**（2754 字节的推送里两段都是推理过程）。
+# 改成 `\s*>?`：`>` 可有可无。副作用面很小 —— 财经播报里不会出现
+# 字面量 `<thinking`；`<0.5%`、`≤` 这类以 `<` 开头的正常文本不匹配，
+# 因为标签名是必选的。
 _THINK_OPEN_RE = re.compile(
-    r"<(?:think(?:ing)?|reasoning|analysis)\s*>.*\Z", re.S | re.I)
+    r"<(?:think(?:ing)?|reasoning|analysis)\s*>?.*\Z", re.S | re.I)
+# ⚠️⚠️ 2026-11-25（P1，真实进群）：**孤儿闭合标签**必须单独剥。
+# `[实测]` 2026-11-19 14:30 那条推送（1867 字节）中间留着：
+#     Write the message now. Only the message body, nothing else.</think>
+# 成因：模型吐了**两段**推理，`_THINK_RE` 非贪婪只吃掉第一对
+# `<think>…</think>`，第二个 `</think>` 失去配对、`_THINK_OPEN_RE` 只管
+# 开标签，于是它原样留在正文里被推给了读者。
+# 修法：闭合标签本身就是纯标记，**无条件剥掉**，不需要配对。
+_THINK_CLOSE_RE = re.compile(
+    r"</(?:think(?:ing)?|reasoning|analysis)\s*>", re.I)
 
 
 def _strip_think(t):
@@ -3585,6 +3607,10 @@ def _strip_think(t):
         return t
     t = _THINK_RE.sub("", t)
     t = _THINK_OPEN_RE.sub("", t)
+    # ⚠️ 顺序：先吃掉成对块与"未闭合的开标签到结尾"，再剥任何残留的
+    # 闭合标签 —— 反过来会把 `</think>` 先删掉，让原本成对的块失去配对的
+    # 闭合端，`_THINK_RE` 就匹配不上、整段推理留在正文里。
+    t = _THINK_CLOSE_RE.sub("", t)
     return t.strip()
 
 
