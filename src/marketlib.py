@@ -6533,7 +6533,7 @@ def _ov_treasury():
     """
     u = ("https://datacenter.eastmoney.com/api/data/get"
          "?type=RPTA_WEB_TREASURYYIELD&sty=ALL&st=SOLAR_DATE&sr=-1"
-         "&token=894050c76af8597a853f5b408b759f5d&p=1&ps=2&pageNo=1&pageNum=1")
+         "&token=894050c76af8597a853f5b408b759f5d&p=1&ps=2&pageNo=1&pageNum=1")  # ggignore
     try:
         raw = subprocess.run(["curl","-s","-m",str(_OV_TIMEOUT),"-A",UA,
                               "-H","Referer: https://data.eastmoney.com/",u],
