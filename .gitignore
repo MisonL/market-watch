@@ -30,3 +30,6 @@ tests/*.log
 
 # CI 产物下载目录（gh run download）—— 上次忘了加，误提交了 py3.13 的失败日志
 test-output-*/
+
+# Added by ggshield
+.cache_ggshield
